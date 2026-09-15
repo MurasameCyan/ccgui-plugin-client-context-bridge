@@ -243,6 +243,28 @@ describe("client context coordinator", () => {
     expect(saved.consumption).toEqual([expect.objectContaining({ targetSessionId: "native-target", consumedRevision: 4 })]);
   });
 
+  it("records consumption when the host rekeys the run id between beforeTurn and afterTurn", async () => {
+    const h = harness();
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.revision = 4;
+    envelope.task.goal = "Finish bridge";
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    h.coordinator.enable();
+    const switchHooks = h.registered.runtimeSwitch as { beforeSwitch(event: unknown): Promise<void> };
+    const turnHooks = h.registered.turn as { beforeTurn(event: typeof turn): Promise<{ promptContributions?: TestContribution[] }>; afterTurn(event: unknown): Promise<void> };
+    await switchHooks.beforeSwitch(switchEvent);
+
+    // The host collects beforeTurn under a placeholder run id and rekeys the
+    // lifecycle to the engine's real run id once the launch resolves; only
+    // turnId survives that rekey, so consumption must pair on turnId.
+    const collected = await turnHooks.beforeTurn({ ...turn, runId: "placeholder-1", turnId: "turn-9", engine: "codex", sessionId: null });
+    collected.promptContributions?.find((entry) => entry.id === "ccb-handoff")?.onAccepted?.();
+    await turnHooks.afterTurn({ ...turn, runId: "engine-run-9", turnId: "turn-9", engine: "codex", sessionId: "native-target", status: "completed" });
+
+    const saved = JSON.parse(h.documents.files.get(`${workspace.id}.ccb`)!.content) as { consumption: Array<{ targetSessionId: string; consumedRevision: number }> };
+    expect(saved.consumption).toEqual([expect.objectContaining({ targetSessionId: "native-target", consumedRevision: 4 })]);
+  });
+
   it("keeps afterSwitch idempotent and flushes before a switch (H2b)", async () => {
     const h = harness();
     const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });

@@ -63,9 +63,12 @@ interface TurnState {
   patch: SemanticPatch | null | undefined;
 }
 
+/** The accepted target turn. `turnId` is the only stable correlation key: the
+ *  host dispatches beforeTurn under a pre-send placeholder run id, then rekeys
+ *  the lifecycle to the engine's real run id once the launch resolves, so
+ *  afterTurn carries a different `runId` for the very same turn. */
 interface AcceptedHandoff {
   revision: number;
-  runId: string;
   turnId: string;
   targetSessionId?: string;
 }
@@ -253,7 +256,7 @@ export class ClientContextCoordinator {
         id: "ccb-handoff", content: compiled.content, placement: "request-tail" as const, visibility: "internal" as const, persistence: "turn" as const,
         onAccepted: () => {
           if (!this.enabled || this.pendingHandoff !== pending || pending.accepted) return;
-          pending.accepted = { revision, runId: event.runId, turnId: event.turnId, ...(event.sessionId ? { targetSessionId: event.sessionId } : {}) };
+          pending.accepted = { revision, turnId: event.turnId, ...(event.sessionId ? { targetSessionId: event.sessionId } : {}) };
           if (event.sessionId) pending.targetSessionId = event.sessionId;
           this.onStatus("continued");
         },
@@ -506,7 +509,7 @@ export class ClientContextCoordinator {
     const pending = this.pendingHandoff;
     const accepted = pending?.accepted;
     if (!pending || !accepted || pending.targetEngine !== event.engine || pending.workspaceId !== event.workspace.id) return undefined;
-    return accepted.runId === event.runId && accepted.turnId === event.turnId ? accepted : undefined;
+    return accepted.turnId === event.turnId ? accepted : undefined;
   }
 
   private nativeSessionKey(engine: string, sessionId: string, workspaceId: string): string {
