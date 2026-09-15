@@ -78,8 +78,11 @@ interface PendingHandoff {
   targetEngine: string;
   workspaceId: string;
   restored: boolean;
-  targetSessionId?: string;
-  accepted?: AcceptedHandoff;
+  /** One entry per accepted injection, keyed by the turn that received it. Two
+   *  turns can both be offered the handoff before either send resolves; each
+   *  needs its own record, or the session that carries the context in its own
+   *  history has no consumption row and is handed the same context again. */
+  accepted: Map<string, AcceptedHandoff>;
 }
 
 const defaultClock: CoordinatorClock = {
@@ -123,7 +126,7 @@ export class ClientContextCoordinator {
       this.context.hooks.registerSessionHooks({
         onCreated: (event) => this.onSessionCreated(event),
         onRestored: (event) => this.onSessionRestored(event),
-        onClosed: (event) => { this.initializedSessions.delete(this.sessionKey(event.engine, event.sessionId, event.workspace.id)); },
+        onClosed: (event) => { if (event.sessionId) this.initializedSessions.delete(this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id)); },
       }),
       this.context.hooks.registerTurnHooks({
         beforeTurn: (event) => this.beforeTurn(event),
@@ -192,10 +195,8 @@ export class ClientContextCoordinator {
 
   private onSessionCreated(event: SessionCreatedEvent): void {
     if (!this.enabled) return;
-    if (event.sessionId) this.rekeyOnlyPendingSession(event.workspace.id, event.engine, event.sessionId);
     if (this.pendingHandoff && event.workspace.id === this.pendingHandoff.workspaceId && event.engine === this.pendingHandoff.targetEngine) {
       this.pendingHandoff.restored = false;
-      if (event.sessionId) this.pendingHandoff.targetSessionId = event.sessionId;
     }
   }
 
@@ -204,7 +205,6 @@ export class ClientContextCoordinator {
     this.initializedSessions.add(this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id));
     if (this.pendingHandoff && event.workspace.id === this.pendingHandoff.workspaceId && event.engine === this.pendingHandoff.targetEngine) {
       this.pendingHandoff.restored = true;
-      this.pendingHandoff.targetSessionId = event.sessionId;
     }
   }
 
@@ -238,7 +238,7 @@ export class ClientContextCoordinator {
 
   private async getHandoff(event: BeforeTurnEvent, currentGitHead?: string): Promise<PromptContribution | undefined> {
     const pending = this.pendingHandoff;
-    if (!pending || pending.restored || pending.sourceEngine === pending.targetEngine || event.engine !== pending.targetEngine || event.workspace.id !== pending.workspaceId || pending.accepted) return undefined;
+    if (!pending || pending.restored || pending.sourceEngine === pending.targetEngine || event.engine !== pending.targetEngine || event.workspace.id !== pending.workspaceId || pending.accepted.size > 0) return undefined;
     try {
       const stored = await this.loadDraft(event.workspace.id, event.engine, event.occurredAt);
       if (!stored || !this.enabled) return undefined;
@@ -255,9 +255,8 @@ export class ClientContextCoordinator {
       return {
         id: "ccb-handoff", content: compiled.content, placement: "request-tail" as const, visibility: "internal" as const, persistence: "turn" as const,
         onAccepted: () => {
-          if (!this.enabled || this.pendingHandoff !== pending || pending.accepted) return;
-          pending.accepted = { revision, turnId: event.turnId, ...(event.sessionId ? { targetSessionId: event.sessionId } : {}) };
-          if (event.sessionId) pending.targetSessionId = event.sessionId;
+          if (!this.enabled || this.pendingHandoff !== pending) return;
+          pending.accepted.set(event.turnId, { revision, turnId: event.turnId, ...(event.sessionId ? { targetSessionId: event.sessionId } : {}) });
           this.onStatus("continued");
         },
       };
@@ -331,6 +330,7 @@ export class ClientContextCoordinator {
     if (!this.enabled) return;
     const patch = this.turns.get(event.turnId)?.patch;
     this.turns.delete(event.turnId);
+    this.settleSessionIdentity(event);
     const metadata = await this.context.workspace.getMetadata();
     await this.serializeWorkspace(event.workspace.id, async () => {
       if (!this.enabled) return;
@@ -345,14 +345,17 @@ export class ClientContextCoordinator {
         },
       };
       const accepted = this.acceptedHandoffFor(event);
-      const targetSessionId = event.sessionId ?? accepted?.targetSessionId ?? this.pendingHandoff?.targetSessionId;
+      // Only the session that actually ran this turn may be recorded. A turn
+      // whose own native id never materialised has no session to file the row
+      // against, and `pendingHandoff` follows any session of the target engine
+      // in this workspace — not the one this handoff was injected into.
+      const targetSessionId = event.sessionId ?? accepted?.targetSessionId;
       const consumption = accepted && targetSessionId
         ? { targetEngine: event.engine, targetSessionId, consumedRevision: accepted.revision, consumedAt: event.occurredAt }
         : undefined;
       draft.stored.envelope = reduceContext(draft.stored.envelope, { now: event.occurredAt, patch: patch ?? null, facts: turnFacts, consumption });
       draft.dirty = true;
       await this.flush(event.workspace.id);
-      if (consumption && this.pendingHandoff) this.pendingHandoff.targetSessionId = targetSessionId;
     });
   }
 
@@ -373,10 +376,7 @@ export class ClientContextCoordinator {
     }
     const existing = this.pendingHandoff;
     if (existing && existing.sourceEngine === event.sourceEngine && existing.targetEngine === event.targetEngine && existing.workspaceId === event.workspace.id) {
-      if (event.targetSessionId && !existing.restored) {
-        existing.restored = true;
-        existing.targetSessionId = event.targetSessionId;
-      }
+      if (event.targetSessionId && !existing.restored) existing.restored = true;
       return;
     }
     this.pendingHandoff = this.createPendingHandoff(event);
@@ -388,7 +388,7 @@ export class ClientContextCoordinator {
       targetEngine: event.targetEngine,
       workspaceId: event.workspace.id,
       restored: event.targetSessionId !== null,
-      ...(event.targetSessionId ? { targetSessionId: event.targetSessionId } : {}),
+      accepted: new Map(),
     };
   }
 
@@ -480,48 +480,38 @@ export class ClientContextCoordinator {
   }
 
   private initializeSession(event: BeforeTurnEvent): boolean {
-    if (event.sessionId) {
-      const pendingKey = this.pendingSessionKey(event.workspace.id, event.engine, event.runId);
-      const nativeKey = this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id);
-      if (this.initializedSessions.delete(pendingKey)) {
-        this.initializedSessions.add(nativeKey);
-        return false;
-      }
-      const firstTurn = !this.initializedSessions.has(nativeKey);
-      this.initializedSessions.add(nativeKey);
-      return firstTurn;
-    }
-    const pendingKey = this.pendingSessionKey(event.workspace.id, event.engine, event.runId || event.turnId);
-    const firstTurn = !this.initializedSessions.has(pendingKey);
-    this.initializedSessions.add(pendingKey);
+    const key = event.sessionId
+      ? this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id)
+      : this.pendingSessionKey(event.workspace.id, event.engine, event.turnId);
+    const firstTurn = !this.initializedSessions.has(key);
+    this.initializedSessions.add(key);
     return firstTurn;
   }
 
-  private rekeyOnlyPendingSession(workspaceId: string, engine: string, sessionId: string): void {
-    const prefix = `${workspaceId}\0${engine}\0pending:`;
-    const pendingKeys = [...this.initializedSessions].filter((key) => key.startsWith(prefix));
-    if (pendingKeys.length !== 1) return;
-    this.initializedSessions.delete(pendingKeys[0]!);
-    this.initializedSessions.add(this.nativeSessionKey(engine, sessionId, workspaceId));
+  /** A turn's beforeTurn can run before its session has a native id, so the
+   *  first-turn marker is keyed by the turn that created it. afterTurn carries
+   *  the same turnId plus the id the session settled on: retire the per-turn
+   *  marker and, once the session identified itself, remember it so its next
+   *  turn is not treated as a first turn again. The host mints a fresh id per
+   *  send and uses it for both runId and turnId, so a runId-keyed marker could
+   *  never be found again and leaked for the process lifetime. */
+  private settleSessionIdentity(event: AfterTurnEvent): void {
+    this.initializedSessions.delete(this.pendingSessionKey(event.workspace.id, event.engine, event.turnId));
+    if (event.sessionId) this.initializedSessions.add(this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id));
   }
 
   private acceptedHandoffFor(event: AfterTurnEvent): AcceptedHandoff | undefined {
     const pending = this.pendingHandoff;
-    const accepted = pending?.accepted;
-    if (!pending || !accepted || pending.targetEngine !== event.engine || pending.workspaceId !== event.workspace.id) return undefined;
-    return accepted.turnId === event.turnId ? accepted : undefined;
+    if (!pending || pending.targetEngine !== event.engine || pending.workspaceId !== event.workspace.id) return undefined;
+    return pending.accepted.get(event.turnId);
   }
 
   private nativeSessionKey(engine: string, sessionId: string, workspaceId: string): string {
     return `${workspaceId}\0${engine}\0native:${sessionId}`;
   }
 
-  private pendingSessionKey(workspaceId: string, engine: string, runId: string): string {
-    return `${workspaceId}\0${engine}\0pending:${runId}`;
-  }
-
-  private sessionKey(engine: string, sessionId: string | null, workspaceId: string): string {
-    return sessionId ? this.nativeSessionKey(engine, sessionId, workspaceId) : `${workspaceId}\0${engine}\0pending:`;
+  private pendingSessionKey(workspaceId: string, engine: string, turnId: string): string {
+    return `${workspaceId}\0${engine}\0pending:${turnId}`;
   }
 }
 

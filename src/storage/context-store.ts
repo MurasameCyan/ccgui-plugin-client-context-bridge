@@ -1,4 +1,4 @@
-import { contentFingerprint, parseCcbEnvelope, type CcbConsumption, type CcbEnvelopeV1, type CcbItem } from "../protocol/schema";
+import { contentFingerprint, parseCcbEnvelope, type CcbEnvelopeV1, type CcbItem } from "../protocol/schema";
 
 export type DocumentStorageLocationKind = "data" | "program" | "custom";
 export interface ResolvedDocumentStorageLocation { kind: DocumentStorageLocationKind; path: string }
@@ -72,15 +72,6 @@ export class ContextStore {
       const written = await this.storage.writeTextAtomic(path, serialize(merged), latest.version);
       return { envelope: merged, version: written.version, baseEnvelope: structuredClone(merged), status: "conflict" };
     }
-  }
-
-  async markConsumed(context: StoredContext, input: Omit<CcbConsumption, "consumedRevision">): Promise<SaveResult> {
-    const next = structuredClone(context.envelope);
-    const consumption: CcbConsumption = { ...input, consumedRevision: next.revision };
-    const index = next.consumption.findIndex((entry) => entry.targetEngine === input.targetEngine && entry.targetSessionId === input.targetSessionId);
-    if (index >= 0) next.consumption[index] = consumption;
-    else next.consumption.push(consumption);
-    return this.save({ envelope: next, version: context.version, baseEnvelope: context.baseEnvelope });
   }
 }
 

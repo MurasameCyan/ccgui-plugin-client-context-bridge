@@ -113,6 +113,27 @@ describe("context reducer", () => {
     expect(next.provenance.degraded).toBe(false);
   });
 
+  it("caps consumption rows so bookkeeping cannot displace task content", () => {
+    let next = createEmptyEnvelope({ workspaceId: "w", engine: "omp", turnStatus: "completed", now: "2026-09-12T12:00:00.000Z" });
+    next.task.goal = "Ship the bridge";
+    // Every cross-client handoff adds one row and nothing else prunes them, so
+    // an unbounded set eventually pushes the document at its byte budget, where
+    // `enforceByteBudget` drops the task payload to keep the bookkeeping.
+    for (let index = 0; index < 60; index += 1) {
+      next = reduceContext(next, {
+        now: "2026-09-12T12:01:00.000Z",
+        consumption: { targetEngine: "codex", targetSessionId: `s${index}`, consumedRevision: 0, consumedAt: "2026-09-12T12:01:00.000Z" },
+      });
+    }
+
+    expect(next.consumption).toHaveLength(50);
+    // The newest rows survive: evicting a recent one would re-offer a handoff to
+    // a session that just consumed it.
+    expect(next.consumption.at(-1)?.targetSessionId).toBe("s59");
+    expect(next.consumption.some((entry) => entry.targetSessionId === "s0")).toBe(false);
+    expect(next.task.goal).toBe("Ship the bridge");
+  });
+
   it("keeps revision stable when repeated facts do not change task content", () => {
     const base = createEmptyEnvelope({ workspaceId: "w", engine: "omp", turnStatus: "completed", now: "2026-09-12T12:00:00.000Z" });
     base.changes.files.push({ path: "src/a.ts", change: "modified", observedAt: "2026-09-12T12:00:30.000Z" });

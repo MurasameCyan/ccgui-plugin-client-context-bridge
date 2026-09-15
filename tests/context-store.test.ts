@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createEmptyEnvelope } from "../src/protocol/schema";
+import { reduceContext } from "../src/state/reducer";
 import { ContextStore, type DocumentStorage } from "../src/storage/context-store";
 
 class MemoryStorage implements DocumentStorage {
@@ -55,16 +56,6 @@ describe("context store", () => {
     expect([...storage.files.keys()].some((path) => path.includes(".conflict-"))).toBe(true);
   });
 
-  it("persists consumption without incrementing task content revision", async () => {
-    const storage = new MemoryStorage();
-    const store = new ContextStore(storage);
-    const envelope = createEmptyEnvelope({ workspaceId: "w", engine: "claude", turnStatus: "completed", now: "2026-09-12T12:00:00.000Z" });
-    const first = await store.save({ envelope, version: null, baseEnvelope: null });
-    const consumed = await store.markConsumed(first, { targetEngine: "codex", targetSessionId: "s1", consumedAt: "2026-09-12T12:01:00.000Z" });
-    expect(consumed.envelope.revision).toBe(0);
-    expect(consumed.envelope.consumption[0].consumedRevision).toBe(0);
-  });
-
   it("returns no context when main and backup are both corrupt", async () => {
     const storage = new MemoryStorage();
     storage.files.set("w.ccb", { content: "bad-main", version: "v2" });
@@ -94,24 +85,23 @@ describe("context store", () => {
     await expect(new ContextStore(storage).load("w")).resolves.toBeNull();
   });
 
-  it("consumption does not refresh content age", async () => {
-    const storage = new MemoryStorage();
-    const store = new ContextStore(storage);
-    const envelope = createEmptyEnvelope({ workspaceId: "w", engine: "claude", turnStatus: "completed", now: "2026-09-01T12:00:00.000Z" });
-    const first = await store.save({ envelope, version: null, baseEnvelope: null });
-    const consumed = await store.markConsumed(first, { targetEngine: "codex", targetSessionId: "s1", consumedAt: "2026-09-12T12:01:00.000Z" });
-    expect(consumed.envelope.updatedAt).toBe("2026-09-01T12:00:00.000Z");
-  });
-
-  it("preserves revision when concurrent writes only change consumption", async () => {
+  it("merges concurrent consumption rows from both writers on conflict", async () => {
     const storage = new MemoryStorage();
     const store = new ContextStore(storage);
     const original = createEmptyEnvelope({ workspaceId: "w", engine: "claude", turnStatus: "completed", now: "2026-09-12T12:00:00.000Z" });
     const first = await store.save({ envelope: original, version: null, baseEnvelope: null });
-    await store.markConsumed(first, { targetEngine: "codex", targetSessionId: "s1", consumedAt: "2026-09-12T12:01:00.000Z" });
-    const conflicted = await store.markConsumed(first, { targetEngine: "omp", targetSessionId: "s2", consumedAt: "2026-09-12T12:02:00.000Z" });
+    const consumed = (targetEngine: string, targetSessionId: string, consumedAt: string) =>
+      reduceContext(first.envelope, {
+        now: consumedAt,
+        consumption: { targetEngine, targetSessionId, consumedRevision: first.envelope.revision, consumedAt },
+      });
+
+    await store.save({ envelope: consumed("codex", "s1", "2026-09-12T12:01:00.000Z"), version: first.version, baseEnvelope: first.envelope });
+    const conflicted = await store.save({ envelope: consumed("omp", "s2", "2026-09-12T12:02:00.000Z"), version: first.version, baseEnvelope: first.envelope });
+
+    expect(conflicted.status).toBe("conflict");
     expect(conflicted.envelope.revision).toBe(0);
-    expect(conflicted.envelope.consumption).toHaveLength(2);
+    expect(conflicted.envelope.consumption.map((entry) => entry.targetSessionId).sort()).toEqual(["s1", "s2"]);
   });
 
   it("keeps a concurrent stable-ID deletion when the other side is unchanged", async () => {

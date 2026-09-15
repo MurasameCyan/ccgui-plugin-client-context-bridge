@@ -21,6 +21,10 @@ const LIMITS = {
   risks: 12,
   verification: 10,
   files: 100,
+  // Bookkeeping rows must stay bounded: every cross-client handoff adds one,
+  // and `enforceByteBudget` would otherwise start dropping the task content
+  // the handoff exists to carry in order to keep them.
+  consumption: 50,
 } as const;
 
 const EVIDENCE_RANK: Record<EvidenceLevel, number> = {
@@ -287,4 +291,12 @@ function removeDegraded(next: CcbEnvelopeV1, reason: string): void {
 function upsertConsumption(next: CcbEnvelopeV1, consumption: CcbConsumption): void {
   const key = (entry: CcbConsumption) => `${entry.targetEngine}\0${entry.targetSessionId}`;
   mergeBy(next.consumption, consumption, key);
+  // Trim here rather than in `enforceLimits`: the consumption-only path skips
+  // that pass entirely, and rows are upserted after it on the full path.
+  // `mergeBy` appends, so the tail is the newest. Evicting the oldest row can
+  // re-offer a handoff to a long-idle session — strictly better than losing
+  // the context itself.
+  if (next.consumption.length > LIMITS.consumption) {
+    next.consumption = next.consumption.slice(-LIMITS.consumption);
+  }
 }
