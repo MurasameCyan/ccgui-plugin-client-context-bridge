@@ -109,8 +109,23 @@ describe("context reducer", () => {
       consumption: { targetEngine: "claude", targetSessionId: "s1", consumedRevision: 0, consumedAt: "2026-09-12T12:01:00.000Z" },
     });
     expect(next.revision).toBe(0);
+    expect(next.updatedAt).toBe(base.updatedAt);
     expect(next.consumption).toHaveLength(1);
     expect(next.provenance.degraded).toBe(false);
+  });
+
+  it("keeps a just-updated consumption when an older document exceeds the cap", () => {
+    const base = createEmptyEnvelope({ workspaceId: "w", engine: "claude", turnStatus: "completed", now: "2026-09-12T12:00:00.000Z" });
+    base.consumption = Array.from({ length: 60 }, (_, index) => ({
+      targetEngine: "codex", targetSessionId: `s${index}`, consumedRevision: 1, consumedAt: base.updatedAt,
+    }));
+    const consumption = { targetEngine: "codex", targetSessionId: "s0", consumedRevision: 2, consumedAt: "2026-09-12T12:01:00.000Z" };
+
+    const next = reduceContext(base, { now: consumption.consumedAt, consumption });
+
+    expect(next.consumption).toHaveLength(50);
+    expect(next.consumption.filter((entry) => entry.targetSessionId === "s0")).toEqual([consumption]);
+    expect(next.consumption.some((entry) => entry.targetSessionId === "s1")).toBe(false);
   });
 
   it("caps consumption rows so bookkeeping cannot displace task content", () => {

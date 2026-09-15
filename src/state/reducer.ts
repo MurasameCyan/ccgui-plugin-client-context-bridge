@@ -191,11 +191,6 @@ function mergeItem<T extends CcbItem>(items: T[], incoming: T): void {
   else if (EVIDENCE_RANK[incoming.source] >= EVIDENCE_RANK[items[index]!.source]) items[index] = incoming;
 }
 
-function mergeBy<T>(items: T[], incoming: T, key: (value: T) => string): void {
-  const index = items.findIndex((item) => key(item) === key(incoming));
-  if (index < 0) items.push(incoming);
-  else items[index] = incoming;
-}
 
 /**
  * Files merge by path (stable id), and a weaker incoming change never replaces
@@ -289,13 +284,12 @@ function removeDegraded(next: CcbEnvelopeV1, reason: string): void {
 }
 
 function upsertConsumption(next: CcbEnvelopeV1, consumption: CcbConsumption): void {
-  const key = (entry: CcbConsumption) => `${entry.targetEngine}\0${entry.targetSessionId}`;
-  mergeBy(next.consumption, consumption, key);
-  // Trim here rather than in `enforceLimits`: the consumption-only path skips
-  // that pass entirely, and rows are upserted after it on the full path.
-  // `mergeBy` appends, so the tail is the newest. Evicting the oldest row can
-  // re-offer a handoff to a long-idle session — strictly better than losing
-  // the context itself.
+  const index = next.consumption.findIndex((entry) =>
+    entry.targetEngine === consumption.targetEngine && entry.targetSessionId === consumption.targetSessionId);
+  if (index !== -1) next.consumption.splice(index, 1);
+  next.consumption.push(consumption);
+  // Keep this update at the tail even when a pre-cap document is loaded.
+  // The consumption-only path skips `enforceLimits`, so trim here.
   if (next.consumption.length > LIMITS.consumption) {
     next.consumption = next.consumption.slice(-LIMITS.consumption);
   }

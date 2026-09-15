@@ -101,6 +101,7 @@ describe("context store", () => {
 
     expect(conflicted.status).toBe("conflict");
     expect(conflicted.envelope.revision).toBe(0);
+    expect(conflicted.envelope.updatedAt).toBe(first.envelope.updatedAt);
     expect(conflicted.envelope.consumption.map((entry) => entry.targetSessionId).sort()).toEqual(["s1", "s2"]);
   });
 
