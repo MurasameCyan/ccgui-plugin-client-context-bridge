@@ -1,6 +1,6 @@
 {
   "id": "ccgui.client-context-bridge",
-  "name": "跨客户端上下文桥接",
+  "name": "Client Context Bridge (CCB)",
   "version": "1.0.0",
   "minAppVersion": "1.0.0",
   "sdkVersion": ">=0.4.0",

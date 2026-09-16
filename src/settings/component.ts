@@ -2,6 +2,10 @@ import type { Disposer, ReactLike } from "../sdk";
 import type { CoordinatorStatus } from "../coordinator/coordinator";
 import type { SettingsModel, SettingsSnapshot } from "./model";
 
+/** Plugin display name, identical in every locale (the host renders the
+ *  trailing acronym one step smaller). Keep in sync with manifest.json. */
+export const DISPLAY_NAME = "Client Context Bridge (CCB)";
+
 const STATUS_LABELS: Record<CoordinatorStatus, { zh: string; en: string }> = {
   synced: { zh: "已同步", en: "Synced" },
   pending: { zh: "等待同步", en: "Pending sync" },
@@ -91,6 +95,6 @@ export function createStatusComponent(
   return function ClientContextBridgeStatus() {
     const [status, setStatus] = react.useState<CoordinatorStatus>(getStatus);
     react.useEffect(() => subscribe(setStatus), []);
-    return react.createElement("span", { title: zh ? "跨客户端上下文桥接" : "Client Context Bridge", "data-status": status }, STATUS_LABELS[status][zh ? "zh" : "en"]);
+    return react.createElement("span", { title: DISPLAY_NAME, "data-status": status }, STATUS_LABELS[status][zh ? "zh" : "en"]);
   };
 }

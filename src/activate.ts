@@ -1,6 +1,6 @@
 import { ClientContextCoordinator, type CoordinatorStatus } from "./coordinator/coordinator";
 import type { Disposer, PluginContext } from "./sdk";
-import { createSettingsComponent, createStatusComponent } from "./settings/component";
+import { DISPLAY_NAME, createSettingsComponent, createStatusComponent } from "./settings/component";
 import { browserDownload, createSettingsModel, type BridgeConfig } from "./settings/model";
 
 const DEFAULT_CONFIG: BridgeConfig = { automationEnabled: false, ttlDays: 7 };
@@ -39,17 +39,20 @@ export default function activate(context: PluginContext): Disposer {
     download: browserDownload,
   });
 
+  // The display name is the same in every locale: it is a product name, not
+  // a translatable phrase. The host renders the trailing "(CCB)" one step
+  // smaller wherever it shows a plugin name.
   disposers.push(context.i18n.addBundle("zh-CN", "client-context-bridge", {
-    title: "跨客户端上下文桥接",
+    title: DISPLAY_NAME,
     status: { synced: "已同步", pending: "等待同步", degraded: "已降级", writeFailed: "写入失败", continued: "已从其他客户端接续", off: "已关闭" },
   }));
   disposers.push(context.i18n.addBundle("en-US", "client-context-bridge", {
-    title: "Client Context Bridge",
+    title: DISPLAY_NAME,
     status: { synced: "Synced", pending: "Pending sync", degraded: "Degraded", writeFailed: "Write failed", continued: "Continued from another client", off: "Off" },
   }));
   disposers.push(context.ui.registerSettingsSection({
     key: "settings",
-    label: () => context.host.locale.toLowerCase().startsWith("zh") ? "跨客户端上下文桥接" : "Client Context Bridge",
+    label: () => DISPLAY_NAME,
     component: createSettingsComponent({ react: context.react, model, locale: context.host.locale }),
   }));
   disposers.push(context.ui.registerStatusBarItem({

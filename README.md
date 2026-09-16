@@ -1,4 +1,4 @@
-# 跨客户端上下文桥接（Client Context Bridge / CCB）
+# Client Context Bridge (CCB)
 
 CCGUI 市场插件。在不同 AI CLI 客户端（Claude Code / Codex CLI / Gemini CLI / OMP …）之间切换时，
 自动维护当前任务的可执行上下文，并在目标客户端的新会话里以一次性内部提示注入，不需要手写交接说明。
@@ -35,7 +35,7 @@ CCGUI 的插件安装走**目录选择**，不接受 zip 文件本身（`plugin_
 1. 解压 `ccgui-plugin-client-context-bridge-1.0.0.zip`，得到一个文件夹，里面是 `manifest.json` + `main.js`
 2. CCGUI → 设置 → 插件管理 → 安装插件 → **选中解压出来的那个文件夹**
 3. 在插件管理里启用插件
-4. 设置 → 跨客户端上下文桥接 → 主动打开自动接续（安装后默认关闭），按需调整存储位置与有效期
+4. 设置 → Client Context Bridge (CCB) → 主动打开自动接续（安装后默认关闭），按需调整存储位置与有效期
 
 ## 怎么验证它在干活
 
