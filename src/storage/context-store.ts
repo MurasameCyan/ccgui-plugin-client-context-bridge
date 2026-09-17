@@ -26,51 +26,74 @@ export interface SaveResult extends StoredContext {
 export class ContextStore {
   constructor(private readonly storage: DocumentStorage) {}
 
-  async load(workspaceId: string): Promise<StoredContext | null> {
+  async load(workspaceId: string, isCurrent: () => boolean): Promise<StoredContext | null> {
+    if (!isCurrent()) return null;
     const path = contextPath(workspaceId);
-    const main = await this.storage.readText(path);
-    if (main) {
-      try {
-        const envelope = parseCcbEnvelope(main.content);
-        if (envelope.workspaceId !== workspaceId) throw new Error("workspace identity mismatch");
-        return { envelope, version: main.version, baseEnvelope: structuredClone(envelope) };
-      } catch {
-        // Continue with the single backup while retaining main's CAS version.
-      }
-    }
-    const backup = await this.storage.readText(`${path}.bak`);
-    if (!backup) return null;
     try {
-      const envelope = parseCcbEnvelope(backup.content);
-      if (envelope.workspaceId !== workspaceId) throw new Error("workspace identity mismatch");
-      addDegraded(envelope, "backup-recovered");
-      return { envelope, version: main?.version ?? null, baseEnvelope: structuredClone(envelope) };
-    } catch {
-      return null;
+      const main = await this.storage.readText(path);
+      if (!isCurrent()) return null;
+      if (main) {
+        try {
+          const envelope = parseCcbEnvelope(main.content);
+          if (envelope.workspaceId !== workspaceId) throw new Error("workspace identity mismatch");
+          return { envelope, version: main.version, baseEnvelope: structuredClone(envelope) };
+        } catch {
+          // Continue with the single backup while retaining main's CAS version.
+        }
+      }
+      if (!isCurrent()) return null;
+      const backup = await this.storage.readText(`${path}.bak`);
+      if (!isCurrent()) return null;
+      if (!backup) return null;
+      try {
+        const envelope = parseCcbEnvelope(backup.content);
+        if (envelope.workspaceId !== workspaceId) throw new Error("workspace identity mismatch");
+        addDegraded(envelope, "backup-recovered");
+        return { envelope, version: main?.version ?? null, baseEnvelope: structuredClone(envelope) };
+      } catch {
+        return null;
+      }
+    } catch (error) {
+      if (!isCurrent()) return null;
+      throw error;
     }
   }
 
-  async save(context: StoredContext): Promise<SaveResult> {
+  async save(context: StoredContext, isCurrent: () => boolean): Promise<SaveResult | null> {
+    if (!isCurrent()) return null;
     const path = contextPath(context.envelope.workspaceId);
     const serialized = serialize(context.envelope);
     try {
-      const written = await this.storage.writeTextAtomic(path, serialized, context.version);
-      return { envelope: context.envelope, version: written.version, baseEnvelope: structuredClone(context.envelope), status: "saved" };
-    } catch (error) {
-      const latest = await this.load(context.envelope.workspaceId);
-      if (!latest) {
-        // The document was removed under us (clear, another window, purge). A
-        // stale in-memory version must not pin the workspace into write-failed.
-        const written = await this.storage.writeTextAtomic(path, serialized, null);
+      try {
+        if (!isCurrent()) return null;
+        const written = await this.storage.writeTextAtomic(path, serialized, context.version);
+        if (!isCurrent()) return null;
         return { envelope: context.envelope, version: written.version, baseEnvelope: structuredClone(context.envelope), status: "saved" };
+      } catch (error) {
+        if (!isCurrent()) return null;
+        const latest = await this.load(context.envelope.workspaceId, isCurrent);
+        if (!isCurrent()) return null;
+        if (!latest) {
+          // The document was removed under us (clear, another window, purge). A
+          // stale in-memory version must not pin the workspace into write-failed.
+          const written = await this.storage.writeTextAtomic(path, serialized, null);
+          if (!isCurrent()) return null;
+          return { envelope: context.envelope, version: written.version, baseEnvelope: structuredClone(context.envelope), status: "saved" };
+        }
+        if (latest.version === context.version) throw error;
+        const merged = mergeConflict(context.baseEnvelope, context.envelope, latest.envelope);
+        addDegraded(merged, "concurrent-write-conflict");
+        const artifactPath = `${path}.conflict-${safeTimestamp()}`;
+        if (!isCurrent()) return null;
+        await this.storage.writeTextAtomic(artifactPath, serialize(context.envelope), null);
+        if (!isCurrent()) return null;
+        const written = await this.storage.writeTextAtomic(path, serialize(merged), latest.version);
+        if (!isCurrent()) return null;
+        return { envelope: merged, version: written.version, baseEnvelope: structuredClone(merged), status: "conflict" };
       }
-      if (latest.version === context.version) throw error;
-      const merged = mergeConflict(context.baseEnvelope, context.envelope, latest.envelope);
-      addDegraded(merged, "concurrent-write-conflict");
-      const artifactPath = `${path}.conflict-${safeTimestamp()}`;
-      await this.storage.writeTextAtomic(artifactPath, serialize(context.envelope), null);
-      const written = await this.storage.writeTextAtomic(path, serialize(merged), latest.version);
-      return { envelope: merged, version: written.version, baseEnvelope: structuredClone(merged), status: "conflict" };
+    } catch (error) {
+      if (!isCurrent()) return null;
+      throw error;
     }
   }
 }

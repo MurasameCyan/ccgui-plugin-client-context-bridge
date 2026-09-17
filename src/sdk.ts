@@ -24,6 +24,7 @@ export interface InternalMessageCapture { channel: string; nonce?: string; maxBy
 export interface BeforeTurnResult {
   promptContributions?: PromptContribution[];
   internalMessageCapture?: InternalMessageCapture;
+  isCurrent?: () => boolean;
 }
 interface SessionEventBase { engine: string; sessionId: string | null; workspace: WorkspaceMetadata; occurredAt: string }
 export interface SessionCreatedEvent extends SessionEventBase {}
@@ -124,6 +125,15 @@ export interface PluginContext {
   ui: {
     registerSettingsSection(definition: { key?: string; label: () => string; icon?: ComponentLike<{ className?: string }>; component: ComponentLike }): Disposer;
     registerStatusBarItem(definition: { key?: string; component: ComponentLike; order?: number }): Disposer;
+    /** Sidebar workspace row context-menu entry (generic host extension point). */
+    registerWorkspaceMenuItem(definition: {
+      key?: string;
+      label: (context: { workspaceId: string; archived: boolean }) => string;
+      icon?: ComponentLike<{ className?: string }>;
+      visible?: (context: { workspaceId: string; archived: boolean }) => boolean;
+      onSelect: (context: { workspaceId: string; archived: boolean }) => void;
+      order?: number;
+    }): Disposer;
   };
   i18n: { addBundle(lang: string, namespace: string, resources: Record<string, unknown>): Disposer };
   storage: {

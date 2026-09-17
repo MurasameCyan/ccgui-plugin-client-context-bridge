@@ -16,6 +16,8 @@ export interface SettingsCoordinator {
 
 export interface SettingsDependencies {
   workspace: { getMetadata(): Promise<WorkspaceMetadata> };
+  /** Latest effective automation state, including global/workspace disable intent and disposal. */
+  workspaceEnabled(workspaceId: string): boolean;
   documents: DocumentStorage;
   coordinator: SettingsCoordinator;
   loadConfig(): Promise<BridgeConfig>;
@@ -53,10 +55,23 @@ function isConflict(error: unknown): boolean {
 
 export function createSettingsModel(dependencies: SettingsDependencies): SettingsModel {
   let configPromise = dependencies.loadConfig();
-  const update = async (change: Partial<BridgeConfig>) => {
-    const config = { ...await configPromise, ...change };
-    configPromise = Promise.resolve(config);
-    await dependencies.saveConfig(config);
+  let configWrites: Promise<void> = Promise.resolve();
+  let automationRequest = 0;
+  const update = (change: Partial<BridgeConfig>, request?: number, stopped?: void | Promise<void>) => {
+    const next = Promise.all([configWrites, stopped]).then(async () => {
+      const previous = await configPromise;
+      const config = { ...previous, ...change };
+      try {
+        await dependencies.saveConfig(config);
+      } catch (error) {
+        if (request === automationRequest) await dependencies.setAutomation(previous.automationEnabled);
+        throw error;
+      }
+      configPromise = Promise.resolve(config);
+      if (request === automationRequest) await dependencies.setAutomation(config.automationEnabled);
+    });
+    configWrites = next.catch(() => {});
+    return next;
   };
   const currentPath = async () => `${(await dependencies.workspace.getMetadata()).id}.ccb`;
 
@@ -84,19 +99,26 @@ export function createSettingsModel(dependencies: SettingsDependencies): Setting
   };
   return {
     async load() {
-      const [config, location] = await Promise.all([configPromise, dependencies.documents.getLocation()]);
-      if (!config.automationEnabled) return { config, location: location.kind, actualPath: null, currentJson: null };
-      const path = await currentPath();
-      const current = await dependencies.documents.readText(path);
-      return { config, location: location.kind, actualPath: location.path, currentJson: current?.content ?? null };
+      const [initialConfig, location] = await Promise.all([configPromise, dependencies.documents.getLocation()]);
+      if (!initialConfig.automationEnabled) return { config: initialConfig, location: location.kind, actualPath: null, currentJson: null };
+      const { id } = await dependencies.workspace.getMetadata();
+      let config = await configPromise;
+      if (!config.automationEnabled || !dependencies.workspaceEnabled(id)) return { config, location: location.kind, actualPath: null, currentJson: null };
+      const current = await dependencies.documents.readText(`${id}.ccb`);
+      config = await configPromise;
+      const enabled = config.automationEnabled && dependencies.workspaceEnabled(id);
+      return { config, location: location.kind, actualPath: enabled ? location.path : null, currentJson: enabled ? current?.content ?? null : null };
     },
     async viewCurrent() {
       const current = await dependencies.documents.readText(await currentPath());
       return current?.content ?? null;
     },
     async setAutomation(enabled) {
-      await update({ automationEnabled: enabled });
-      await dependencies.setAutomation(enabled);
+      const request = ++automationRequest;
+      // Disable intent takes effect before entering the persistence queue. An
+      // older enable may commit meanwhile, but may no longer reactivate hooks.
+      const stopped = enabled ? undefined : dependencies.setAutomation(false);
+      await update({ automationEnabled: enabled }, request, stopped);
     },
     async setLocation(kind) {
       if ((await dependencies.documents.getLocation()).kind === kind) return;

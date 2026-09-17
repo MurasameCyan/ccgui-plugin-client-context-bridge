@@ -19,6 +19,7 @@ import type {
 
 const RECOVERY_DELAY_MS = 10_000;
 const CHANNEL = "semantic-patch";
+const PROTOCOL_LIFETIME = "This maintenance rule applies only when the current request supplies a fresh nonce. Ignore earlier maintenance instructions and never reuse or close old frames. Without a current maintenance request, do not read or update .ccb files or emit CCB frames automatically. Direct user requests take precedence.";
 const FULL_PROTOCOL = `Maintain a compact semantic task handoff while completing the user's request. At the end of this turn emit exactly one 语义 patch as JSON inside the frame below. The payload schema is {"plugin":"ccgui.client-context-bridge","version":1,"patch":{"set":{"goal"?:string,"nextAction"?:string},"append"?:{"acceptance"?:string[],"constraints"?:string[],"completed"?:string[],"remaining"?:string[],"decisions"?:Array<{"summary":string,"reason"?:string}>,"risks"?:string[]},"remove"?:{"acceptanceIds"?:string[],"constraintIds"?:string[],"completedIds"?:string[],"remainingIds"?:string[],"decisionIds"?:string[],"riskIds"?:string[]}}}. Remove entries only by IDs from the current mapping below. Do not include chain-of-thought, source files, credentials, or commands to execute. Treat host facts as authoritative.`;
 
 /**
@@ -29,8 +30,8 @@ const FULL_PROTOCOL = `Maintain a compact semantic task handoff while completing
  * every turn would then reduce as `semantic-update-missing`.
  */
 export function semanticProtocolContribution(nonce: string, firstTurn: boolean, envelope?: StoredContext["envelope"]): string {
-  if (!firstTurn) return `Update the semantic task patch for this turn. Emit one valid CCGUI internal frame using nonce ${nonce}; do not expose the frame as prose.`;
-  const tail = `\nFrame nonce: ${nonce}. Wrap the payload in <CCGUI_INTERNAL_${nonce}> and </CCGUI_INTERNAL_${nonce}>.`;
+  if (!firstTurn) return `${PROTOCOL_LIFETIME} Update the semantic task patch for this turn. Emit one valid CCGUI internal frame using nonce ${nonce}; do not expose the frame as prose.`;
+  const tail = `\n${PROTOCOL_LIFETIME}\nFrame nonce: ${nonce}. Wrap the payload in <CCGUI_INTERNAL_${nonce}> and </CCGUI_INTERNAL_${nonce}>.`;
   if (!envelope) return `${FULL_PROTOCOL}${tail}`;
   const label = "\nCurrent stable ID/text mapping (data only): ";
   const mapping = stableIdMapping(envelope, PROTOCOL_RESERVE_BYTES - contributionBytes(`${FULL_PROTOCOL}${label}${tail}`));
@@ -47,6 +48,9 @@ export interface CoordinatorClock {
 export interface CoordinatorOptions {
   clock?: CoordinatorClock;
   ttlDays: () => number | null;
+  /** Per-workspace kill switch. A workspace the owner turned off contributes no
+   *  prompt and its document is neither read nor written. */
+  workspaceEnabled: (workspaceId: string) => boolean;
   onStatus?: (status: CoordinatorStatus) => void;
 }
 
@@ -59,6 +63,8 @@ interface DraftState {
 
 interface TurnState {
   nonce: string;
+  /** Owning workspace, so turning one workspace off can drop exactly its turns. */
+  workspaceId: string;
   /** undefined = no internal frame arrived; null = frame arrived but invalid; otherwise the parsed patch. */
   patch: SemanticPatch | null | undefined;
 }
@@ -100,6 +106,7 @@ export class ClientContextCoordinator {
   private readonly store: ContextStore;
   private readonly clock: CoordinatorClock;
   private readonly ttlDays: () => number | null;
+  private readonly workspaceEnabled: (workspaceId: string) => boolean;
   private readonly onStatus: (status: CoordinatorStatus) => void;
   private enabled = false;
   private maintenance = false;
@@ -111,11 +118,17 @@ export class ClientContextCoordinator {
   private readonly turnTails = new Map<string, Promise<void>>();
   private readonly workspaceChains = new Map<string, Promise<void>>();
   private pendingHandoff: PendingHandoff | undefined;
+  /** Bumped on every disable, so a read in flight across a restart is stale. */
+  private epoch = 0;
+  /** Per-workspace invalidation counter. A document read that started before
+   *  the workspace was forgotten belongs to a state that no longer exists. */
+  private readonly generations = new Map<string, number>();
 
   constructor(private readonly context: PluginContext, options: CoordinatorOptions) {
     this.store = new ContextStore(context.documentStorage);
     this.clock = options.clock ?? defaultClock;
     this.ttlDays = options.ttlDays;
+    this.workspaceEnabled = options.workspaceEnabled;
     this.onStatus = options.onStatus ?? (() => {});
   }
 
@@ -155,6 +168,8 @@ export class ClientContextCoordinator {
     this.turnTails.clear();
     this.workspaceChains.clear();
     this.pendingHandoff = undefined;
+    this.epoch += 1;
+    this.generations.clear();
     this.onStatus("off");
   }
 
@@ -164,13 +179,19 @@ export class ClientContextCoordinator {
    * draft to the current root, then block new writes until resumed.
    */
   async pauseForMaintenance(): Promise<void> {
+    const epoch = this.epoch;
+    const generations = new Map(this.generations);
     this.maintenance = true;
     if (this.recoveryTimer !== undefined) {
       this.clock.clearTimeout(this.recoveryTimer);
       this.recoveryTimer = undefined;
     }
     await this.quiesce();
-    await Promise.all([...this.drafts.keys()].map((workspaceId) => this.serializeWorkspace(workspaceId, () => this.flush(workspaceId, true))));
+    if (!this.enabled || this.epoch !== epoch) return;
+    await Promise.all([...this.drafts.keys()].map((workspaceId) => {
+      const isCurrent = this.captureLifetime(workspaceId, epoch, generations.get(workspaceId) ?? 0);
+      return this.serializeWorkspace(workspaceId, () => this.flush(workspaceId, isCurrent, true));
+    }));
   }
 
   resumeFromMaintenance(): void {
@@ -186,22 +207,60 @@ export class ClientContextCoordinator {
   purgeDrafts(entries: string[]): void {
     for (const entry of entries) {
       const workspaceId = workspaceIdFromEntry(entry);
-      if (!workspaceId) continue;
-      this.drafts.delete(workspaceId);
-      if (this.pendingHandoff?.workspaceId === workspaceId) this.pendingHandoff = undefined;
-      for (const key of [...this.initializedSessions]) if (key.startsWith(`${workspaceId}\0`)) this.initializedSessions.delete(key);
+      if (workspaceId) this.forgetWorkspace(workspaceId);
     }
   }
 
+  /**
+   * The owner switched one workspace off. Forget it, wait for the work already
+   * dispatched for it to settle, then forget it again so a late callback cannot
+   * resurrect its draft. Other workspaces keep running and are not flushed;
+   * autosave is disarmed only once nothing dirty is left anywhere.
+   */
+  async deactivateWorkspace(workspaceId: string): Promise<void> {
+    const turnIds = [...this.turns].filter(([, turn]) => turn.workspaceId === workspaceId).map(([turnId]) => turnId);
+    this.forgetWorkspace(workspaceId);
+    for (let round = 0; round < 3; round += 1) {
+      const tails = [this.workspaceChains.get(workspaceId), ...turnIds.map((turnId) => this.turnTails.get(turnId))]
+        .filter((tail): tail is Promise<void> => tail !== undefined);
+      if (tails.length === 0) break;
+      await Promise.all(tails.map((tail) => tail.catch(() => {})));
+    }
+    this.forgetWorkspace(workspaceId);
+    if (this.recoveryTimer !== undefined && ![...this.drafts.values()].some((draft) => draft.dirty)) {
+      this.clock.clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = undefined;
+    }
+  }
+
+  /** Forget everything held for one workspace and invalidate its pending reads. */
+  private forgetWorkspace(workspaceId: string): void {
+    this.generations.set(workspaceId, (this.generations.get(workspaceId) ?? 0) + 1);
+    this.drafts.delete(workspaceId);
+    if (this.pendingHandoff?.workspaceId === workspaceId) this.pendingHandoff = undefined;
+    for (const key of [...this.initializedSessions]) if (key.startsWith(`${workspaceId}\0`)) this.initializedSessions.delete(key);
+    for (const [turnId, turn] of [...this.turns]) if (turn.workspaceId === workspaceId) this.turns.delete(turnId);
+  }
+
+  /** Operational for this workspace: globally enabled and not turned off for it. */
+  private isActive(workspaceId: string): boolean {
+    return this.enabled && this.workspaceEnabled(workspaceId);
+  }
+
+  /** Keep the originating lifetime across queues, awaits, and nested storage I/O. */
+  private captureLifetime(workspaceId: string, epoch = this.epoch, generation = this.generations.get(workspaceId) ?? 0): () => boolean {
+    return () => this.isActive(workspaceId) && this.epoch === epoch && (this.generations.get(workspaceId) ?? 0) === generation;
+  }
+
   private onSessionCreated(event: SessionCreatedEvent): void {
-    if (!this.enabled) return;
+    if (!this.isActive(event.workspace.id)) return;
     if (this.pendingHandoff && event.workspace.id === this.pendingHandoff.workspaceId && event.engine === this.pendingHandoff.targetEngine) {
       this.pendingHandoff.restored = false;
     }
   }
 
   private onSessionRestored(event: SessionRestoredEvent): void {
-    if (!this.enabled) return;
+    if (!this.isActive(event.workspace.id)) return;
     this.initializedSessions.add(this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id));
     if (this.pendingHandoff && event.workspace.id === this.pendingHandoff.workspaceId && event.engine === this.pendingHandoff.targetEngine) {
       this.pendingHandoff.restored = true;
@@ -209,39 +268,45 @@ export class ClientContextCoordinator {
   }
 
   private async beforeTurn(event: BeforeTurnEvent): Promise<BeforeTurnResult | void> {
-    if (!this.enabled) return;
+    if (!this.isActive(event.workspace.id)) return;
     const nonce = this.clock.nonce();
-    this.turns.set(event.turnId, { nonce, patch: undefined });
+    const turn: TurnState = { nonce, workspaceId: event.workspace.id, patch: undefined };
+    this.turns.set(event.turnId, turn);
+    const lifetime = this.captureLifetime(event.workspace.id);
+    const isCurrent = () => lifetime() && this.turns.get(event.turnId) === turn;
     const firstTurn = this.initializeSession(event);
     const promptContributions: PromptContribution[] = [];
 
     const metadata = await this.context.workspace.getMetadata();
-    const handoff = await this.getHandoff(event, metadata.gitHead);
-    if (!this.enabled) {
-      this.turns.delete(event.turnId);
-      return;
-    }
+    if (!isCurrent()) return;
+    const handoff = await this.getHandoff(event, isCurrent, metadata.gitHead);
+    if (!isCurrent()) return;
     if (handoff) promptContributions.push(handoff);
 
     let envelope = this.drafts.get(event.workspace.id)?.stored.envelope;
     if (firstTurn && !envelope) {
       try {
-        envelope = (await this.loadDraft(event.workspace.id, event.engine, event.occurredAt))?.envelope;
+        envelope = (await this.loadDraft(event.workspace.id, isCurrent))?.envelope;
       } catch {
-        this.onStatus("degraded");
+        if (isCurrent()) this.onStatus("degraded");
       }
     }
+    // Every await above can outlive the workspace: the owner may switch it off,
+    // or purge it, while metadata and the document are read. A turn whose state
+    // is gone contributes nothing and leaves nothing behind.
+    if (!isCurrent()) return;
     const protocol = semanticProtocolContribution(nonce, firstTurn, envelope);
     promptContributions.push({ id: `ccb-protocol-${event.turnId}`, content: protocol, placement: "request-tail" as const, visibility: "internal" as const, persistence: "turn" as const });
-    return { promptContributions, internalMessageCapture: { channel: CHANNEL, nonce, maxBytes: MAX_PATCH_BYTES, validate: isCompleteInternalFrame } };
+    return { promptContributions, internalMessageCapture: { channel: CHANNEL, nonce, maxBytes: MAX_PATCH_BYTES, validate: isCompleteInternalFrame }, isCurrent: lifetime };
   }
 
-  private async getHandoff(event: BeforeTurnEvent, currentGitHead?: string): Promise<PromptContribution | undefined> {
+  private async getHandoff(event: BeforeTurnEvent, isCurrent: () => boolean, currentGitHead?: string): Promise<PromptContribution | undefined> {
     const pending = this.pendingHandoff;
+    if (!isCurrent()) return undefined;
     if (!pending || pending.restored || pending.sourceEngine === pending.targetEngine || event.engine !== pending.targetEngine || event.workspace.id !== pending.workspaceId || pending.accepted.size > 0) return undefined;
     try {
-      const stored = await this.loadDraft(event.workspace.id, event.engine, event.occurredAt);
-      if (!stored || !this.enabled) return undefined;
+      const stored = await this.loadDraft(event.workspace.id, isCurrent);
+      if (!stored || !isCurrent() || this.pendingHandoff !== pending) return undefined;
       // The document holds at most one row per (engine, session) — that is
       // exactly what `upsertConsumption` dedupes on — so the row itself is the
       // one-shot record. Comparing revisions could never hold: the same write
@@ -255,25 +320,31 @@ export class ClientContextCoordinator {
       return {
         id: "ccb-handoff", content: compiled.content, placement: "request-tail" as const, visibility: "internal" as const, persistence: "turn" as const,
         onAccepted: () => {
-          if (!this.enabled || this.pendingHandoff !== pending) return;
+          if (!isCurrent() || this.pendingHandoff !== pending) return;
           pending.accepted.set(event.turnId, { revision, turnId: event.turnId, ...(event.sessionId ? { targetSessionId: event.sessionId } : {}) });
           this.onStatus("continued");
         },
       };
     } catch {
-      this.onStatus("degraded");
+      if (isCurrent()) this.onStatus("degraded");
       return undefined;
     }
   }
 
   private onRuntimeEvent(event: NormalizedRuntimeEvent): void {
-    if (!this.enabled) return;
-    void this.enqueue(event.turnId, () => this.serializeWorkspace(event.workspaceId, () => this.applyRuntimeEvent(event))).catch(() => this.onStatus("degraded"));
+    if (!this.isActive(event.workspaceId)) return;
+    const isCurrent = this.captureLifetime(event.workspaceId);
+    void this.enqueue(event.turnId, () => this.serializeWorkspace(event.workspaceId, () => this.applyRuntimeEvent(event, isCurrent))).catch(() => {
+      if (isCurrent()) this.onStatus("degraded");
+    });
   }
 
-  private async applyRuntimeEvent(event: NormalizedRuntimeEvent): Promise<void> {
-    const draft = await this.ensureDraft(event.workspaceId, event.engine, event.occurredAt);
-    if (!this.enabled) return;
+  private async applyRuntimeEvent(event: NormalizedRuntimeEvent, isCurrent: () => boolean): Promise<void> {
+    // Checked before the draft is loaded: an event that sat in the queue must
+    // not read the document of a workspace that has since been switched off.
+    if (!isCurrent()) return;
+    const draft = await this.ensureDraft(event.workspaceId, event.engine, event.occurredAt, isCurrent);
+    if (!draft || !isCurrent()) return;
     const facts: HostFacts = { source: { engine: event.engine, nativeSessionId: event.sessionId ?? undefined, turnId: event.turnId } };
     if (event.kind === "file-changed") facts.changedFiles = [{ path: event.path, change: event.change, observedAt: event.occurredAt }];
     if (event.kind === "command-started") {
@@ -303,8 +374,10 @@ export class ClientContextCoordinator {
   }
 
   private onInternalMessage(event: InternalMessageEvent): void {
-    if (!this.enabled || event.channel !== CHANNEL) return;
+    if (!this.isActive(event.workspace.id) || event.channel !== CHANNEL) return;
+    const isCurrent = this.captureLifetime(event.workspace.id);
     void this.enqueue(event.turnId, async () => {
+      if (!isCurrent()) return;
       const turn = this.turns.get(event.turnId);
       if (!turn || turn.nonce !== event.nonce) return;
       try {
@@ -325,16 +398,19 @@ export class ClientContextCoordinator {
   }
 
   private async afterTurn(event: AfterTurnEvent): Promise<void> {
-    if (!this.enabled) return;
+    if (!this.isActive(event.workspace.id)) return;
+    const isCurrent = this.captureLifetime(event.workspace.id);
     await this.drainTurn(event.turnId);
-    if (!this.enabled) return;
+    if (!isCurrent()) return;
     const patch = this.turns.get(event.turnId)?.patch;
     this.turns.delete(event.turnId);
     this.settleSessionIdentity(event);
     const metadata = await this.context.workspace.getMetadata();
+    if (!isCurrent()) return;
     await this.serializeWorkspace(event.workspace.id, async () => {
-      if (!this.enabled) return;
-      const draft = await this.ensureDraft(event.workspace.id, event.engine, event.occurredAt);
+      if (!isCurrent()) return;
+      const draft = await this.ensureDraft(event.workspace.id, event.engine, event.occurredAt, isCurrent);
+      if (!draft || !isCurrent()) return;
       const turnFacts: HostFacts = {
         source: { engine: event.engine, nativeSessionId: event.sessionId ?? undefined, turnId: event.turnId, turnStatus: event.status },
         workspace: {
@@ -355,13 +431,15 @@ export class ClientContextCoordinator {
         : undefined;
       draft.stored.envelope = reduceContext(draft.stored.envelope, { now: event.occurredAt, patch: patch ?? null, facts: turnFacts, consumption });
       draft.dirty = true;
-      await this.flush(event.workspace.id);
+      await this.flush(event.workspace.id, isCurrent);
     });
   }
 
   private async beforeSwitch(event: RuntimeSwitchEvent): Promise<void> {
-    if (!this.enabled) return;
-    await this.flush(event.workspace.id);
+    if (!this.isActive(event.workspace.id)) return;
+    const isCurrent = this.captureLifetime(event.workspace.id);
+    await this.flush(event.workspace.id, isCurrent);
+    if (!isCurrent()) return;
     if (event.sourceEngine === event.targetEngine) {
       this.pendingHandoff = undefined;
       return;
@@ -370,6 +448,7 @@ export class ClientContextCoordinator {
   }
 
   private afterSwitch(event: RuntimeSwitchEvent): void {
+    if (!this.workspaceEnabled(event.workspace.id)) return;
     if (!this.enabled || event.sourceEngine === event.targetEngine) {
       this.pendingHandoff = undefined;
       return;
@@ -392,41 +471,55 @@ export class ClientContextCoordinator {
     };
   }
 
-  private async ensureDraft(workspaceId: string, engine: string, occurredAt: string): Promise<DraftState> {
+  /** `undefined` when the workspace was forgotten while its document was read. */
+  private async ensureDraft(workspaceId: string, engine: string, occurredAt: string, isCurrent: () => boolean): Promise<DraftState | undefined> {
+    if (!isCurrent()) return undefined;
     const existing = this.drafts.get(workspaceId);
     if (existing) return existing;
-    const loaded = await this.loadDraft(workspaceId, engine, occurredAt);
-    if (loaded) return this.drafts.get(workspaceId)!;
+    const loaded = await this.loadDraft(workspaceId, isCurrent);
+    if (!isCurrent() || loaded === undefined) return undefined;
+    const installed = this.drafts.get(workspaceId);
+    if (installed) return installed;
     const envelope = createEmptyEnvelope({ workspaceId, engine, turnStatus: "completed", now: occurredAt });
     const draft = { stored: { envelope, version: null, baseEnvelope: null }, dirty: false };
     this.drafts.set(workspaceId, draft);
     return draft;
   }
 
-  private async loadDraft(workspaceId: string, engine: string, occurredAt: string): Promise<StoredContext | null> {
+  /**
+   * The workspace draft, loading it from storage once. `null` means the
+   * workspace has no stored document; `undefined` means the read outlived the
+   * state it was started for — the workspace was switched off, purged, or the
+   * coordinator restarted — so the result is neither cached nor used.
+   */
+  private async loadDraft(workspaceId: string, isCurrent: () => boolean): Promise<StoredContext | null | undefined> {
+    if (!isCurrent()) return undefined;
     const existing = this.drafts.get(workspaceId);
     if (existing) return existing.stored;
-    const loaded = await this.store.load(workspaceId);
-    if (loaded) {
-      this.drafts.set(workspaceId, { stored: loaded, dirty: false });
-      return loaded;
-    }
-    void engine;
-    void occurredAt;
-    return null;
+    const loaded = await this.store.load(workspaceId, isCurrent);
+    if (!isCurrent()) return undefined;
+    const installed = this.drafts.get(workspaceId);
+    if (installed) return installed.stored;
+    if (!loaded) return null;
+    this.drafts.set(workspaceId, { stored: loaded, dirty: false });
+    return loaded;
   }
 
   private scheduleRecovery(): void {
     if (this.recoveryTimer !== undefined) return;
+    const epoch = this.epoch;
     this.recoveryTimer = this.clock.setTimeout(() => {
+      if (!this.enabled || this.epoch !== epoch) return;
       this.recoveryTimer = undefined;
-      if (!this.enabled) return;
-      void Promise.all([...this.drafts.entries()].filter(([, draft]) => draft.dirty).map(([workspaceId]) => this.serializeWorkspace(workspaceId, () => this.flush(workspaceId))));
+      void Promise.all([...this.drafts.entries()].filter(([, draft]) => draft.dirty).map(([workspaceId]) => {
+        const isCurrent = this.captureLifetime(workspaceId);
+        return this.serializeWorkspace(workspaceId, () => this.flush(workspaceId, isCurrent));
+      }));
     }, RECOVERY_DELAY_MS);
   }
 
-  private async flush(workspaceId: string, force = false): Promise<void> {
-    if (!this.enabled || (this.maintenance && !force)) return;
+  private async flush(workspaceId: string, isCurrent: () => boolean, force = false): Promise<void> {
+    if (!isCurrent() || (this.maintenance && !force)) return;
     const draft = this.drafts.get(workspaceId);
     if (!draft?.dirty) return;
     try {
@@ -434,11 +527,13 @@ export class ClientContextCoordinator {
         this.clock.clearTimeout(this.recoveryTimer);
         this.recoveryTimer = undefined;
       }
-      draft.stored = await this.store.save(draft.stored);
+      const saved = await this.store.save(draft.stored, isCurrent);
+      if (!saved || !isCurrent()) return;
+      draft.stored = saved;
       draft.dirty = false;
       this.onStatus(draft.stored.envelope.provenance.degraded ? "degraded" : "synced");
     } catch {
-      this.onStatus("write-failed");
+      if (isCurrent()) this.onStatus("write-failed");
     }
   }
 

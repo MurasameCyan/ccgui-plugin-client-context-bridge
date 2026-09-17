@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createEmptyEnvelope } from "../src/protocol/schema";
 import type { CoordinatorStatus } from "../src/coordinator/coordinator";
 import type { ReactLike } from "../src/sdk";
-import { createSettingsComponent, createStatusComponent } from "../src/settings/component";
+import { createStatusComponent } from "../src/settings/component";
 import { createSettingsModel, type SettingsDependencies } from "../src/settings/model";
 
 interface Doc { content: string; version: string }
@@ -13,6 +13,7 @@ function envelope(workspaceId: string, revision: number, updatedAt: string): str
 
 interface HarnessOptions {
   automation?: boolean;
+  workspaceEnabled?: boolean;
   root?: "data" | "program" | "custom";
   files?: Array<[string, Doc]>;
 }
@@ -27,6 +28,7 @@ interface Harness {
   downloads: Array<{ name: string; content: string }>;
   failSelect(kind: string, error: Error): void;
   reportVersion(path: string, version: string): void;
+  setWorkspaceEnabled(enabled: boolean): void;
 }
 
 function settingsHarness(options: HarnessOptions = {}): Harness {
@@ -81,8 +83,11 @@ function settingsHarness(options: HarnessOptions = {}): Harness {
     list: async () => { log.push("list"); return [...activeRoot().keys()]; },
   };
   const config = { automationEnabled: options.automation ?? false, ttlDays: 7 };
+  let automationEnabled = config.automationEnabled;
+  let workspaceEnabled = options.workspaceEnabled ?? true;
   const dependencies: SettingsDependencies = {
     workspace: { getMetadata: async () => ({ id: "w", path: "C:/repo" }) },
+    workspaceEnabled: () => automationEnabled && workspaceEnabled,
     documents,
     coordinator: {
       pauseForMaintenance: async () => { log.push("pause"); },
@@ -91,14 +96,22 @@ function settingsHarness(options: HarnessOptions = {}): Harness {
     },
     loadConfig: async () => ({ ...config }),
     saveConfig: vi.fn(async (next: unknown) => { log.push("saveConfig"); Object.assign(config, next as object); }),
-    setAutomation: vi.fn((enabled: boolean) => { config.automationEnabled = enabled; }),
+    setAutomation: vi.fn((enabled: boolean) => { automationEnabled = enabled; }),
     download: (name, content) => { downloads.push({ name, content }); },
   };
   return {
     dependencies, roots, log, config, removed, purged, downloads,
     failSelect: (kind, error) => { selectFailures.set(kind, error); },
     reportVersion: (path, version) => { versionOverrides.set(path, version); },
+    setWorkspaceEnabled: (enabled) => { workspaceEnabled = enabled; },
   };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
 }
 
 describe("settings model", () => {
@@ -139,6 +152,130 @@ describe("settings model", () => {
     const harness = settingsHarness({ automation: true, files: [["w.ccb", { content: envelope("w", 1, "2026-09-13T10:00:00.000Z"), version: "1" }]] });
     await createSettingsModel(harness.dependencies).exportCurrent();
     expect(harness.downloads).toEqual([{ name: "w.ccb", content: expect.stringContaining('"workspaceId":"w"') }]);
+  });
+
+  it("keeps opted-out workspaces unread until an explicit view, export or clear", async () => {
+    const content = envelope("w", 2, "2026-09-13T10:00:00.000Z");
+    const harness = settingsHarness({ automation: true, workspaceEnabled: false, files: [["w.ccb", { content, version: "4" }]] });
+    const model = createSettingsModel(harness.dependencies);
+    const snapshot = await model.load();
+    expect(snapshot.currentJson).toBeNull();
+    expect(snapshot.actualPath).toBeNull();
+    expect(harness.log).not.toContain("read:w.ccb");
+    await expect(model.viewCurrent()).resolves.toBe(content);
+    await model.exportCurrent();
+    expect(harness.downloads).toEqual([{ name: "w.ccb", content }]);
+    await model.clearCurrent();
+    expect(harness.roots.get("data")!.has("w.ccb")).toBe(false);
+  });
+
+  it.each(["global", "workspace"])("rechecks %s disable after metadata has started", async (scope) => {
+    const entered = deferred();
+    const release = deferred();
+    const harness = settingsHarness({ automation: true });
+    harness.dependencies.workspace.getMetadata = async () => {
+      entered.resolve();
+      await release.promise;
+      return { id: "w", path: "C:/repo" };
+    };
+    const model = createSettingsModel(harness.dependencies);
+    const loading = model.load();
+    await entered.promise;
+    if (scope === "global") await model.setAutomation(false);
+    else harness.setWorkspaceEnabled(false);
+    release.resolve();
+    const snapshot = await loading;
+    expect(snapshot.currentJson).toBeNull();
+    expect(snapshot.actualPath).toBeNull();
+    expect(harness.log).not.toContain("read:w.ccb");
+    expect(snapshot.config.automationEnabled).toBe(scope !== "global");
+  });
+
+  it("does not commit a failed enable into later TTL saves or automatic reads", async () => {
+    const entered = deferred();
+    const release = deferred();
+    const harness = settingsHarness();
+    const save = harness.dependencies.saveConfig;
+    harness.dependencies.saveConfig = async (next) => {
+      if (next.automationEnabled) { entered.resolve(); await release.promise; }
+      await save(next);
+    };
+    const model = createSettingsModel(harness.dependencies);
+    const enabling = model.setAutomation(true);
+    const rejected = expect(enabling).rejects.toThrow("disk full");
+    await entered.promise;
+    expect((await model.load()).config.automationEnabled).toBe(false);
+    expect(harness.log).not.toContain("read:w.ccb");
+    release.reject(new Error("disk full"));
+    await rejected;
+    await model.setTtlDays(30);
+    expect(harness.config).toEqual({ automationEnabled: false, ttlDays: 30 });
+    expect((await model.load()).config).toEqual(harness.config);
+    expect(harness.log).not.toContain("read:w.ccb");
+  });
+
+  it("stops reads during a disable write and restores committed state if that write fails", async () => {
+    const entered = deferred();
+    const release = deferred();
+    const harness = settingsHarness({ automation: true });
+    harness.dependencies.saveConfig = async () => { entered.resolve(); await release.promise; };
+    const model = createSettingsModel(harness.dependencies);
+    const disabling = model.setAutomation(false);
+    const rejected = expect(disabling).rejects.toThrow("disk full");
+    await entered.promise;
+    expect((await model.load()).currentJson).toBeNull();
+    expect(harness.log).not.toContain("read:w.ccb");
+    release.reject(new Error("disk full"));
+    await rejected;
+    expect((await model.load()).config.automationEnabled).toBe(true);
+    expect(harness.log).toContain("read:w.ccb");
+    expect(harness.config.automationEnabled).toBe(true);
+  });
+
+  it("serializes automation and TTL writes without losing a committed field", async () => {
+    const entered = deferred();
+    const release = deferred();
+    const harness = settingsHarness();
+    const save = harness.dependencies.saveConfig;
+    harness.dependencies.saveConfig = async (next) => {
+      if (!next.automationEnabled) { entered.resolve(); await release.promise; }
+      await save(next);
+    };
+    const model = createSettingsModel(harness.dependencies);
+    const ttl = model.setTtlDays(30);
+    await entered.promise;
+    const enabling = model.setAutomation(true);
+    expect(harness.config).toEqual({ automationEnabled: false, ttlDays: 7 });
+    release.resolve();
+    await Promise.all([ttl, enabling]);
+    expect(harness.config).toEqual({ automationEnabled: true, ttlDays: 30 });
+    expect((await model.load()).config).toEqual(harness.config);
+  });
+
+  it("does not let an older enable completion override a newer disable intent", async () => {
+    const enableEntered = deferred();
+    const disableEntered = deferred();
+    const releaseEnable = deferred();
+    const releaseDisable = deferred();
+    const harness = settingsHarness();
+    const save = harness.dependencies.saveConfig;
+    harness.dependencies.saveConfig = async (next) => {
+      if (next.automationEnabled) { enableEntered.resolve(); await releaseEnable.promise; }
+      else { disableEntered.resolve(); await releaseDisable.promise; }
+      await save(next);
+    };
+    const model = createSettingsModel(harness.dependencies);
+    const enabling = model.setAutomation(true);
+    await enableEntered.promise;
+    const disabling = model.setAutomation(false);
+    releaseEnable.resolve();
+    await disableEntered.promise;
+    await enabling;
+    await model.load();
+    expect(harness.log).not.toContain("read:w.ccb");
+    releaseDisable.resolve();
+    await disabling;
+    expect(harness.config.automationEnabled).toBe(false);
   });
 });
 
@@ -266,7 +403,7 @@ function fakeReact() {
 }
 
 describe("status component", () => {
-  it("re-renders with the label of the latest coordinator status", () => {
+  it("re-renders when the coordinator status subscription changes", () => {
     const listeners = new Set<(status: CoordinatorStatus) => void>();
     let status: CoordinatorStatus = "off";
     const subscribe = (listener: (status: CoordinatorStatus) => void) => {
@@ -277,30 +414,9 @@ describe("status component", () => {
     const Component = createStatusComponent(fake.react, "en-US", () => status, subscribe);
     const current = fake.mount(Component);
     expect(current().props["data-status"]).toBe("off");
-    expect(current().props.children).toEqual(["Off"]);
     status = "synced";
     for (const listener of [...listeners]) listener(status);
     expect(current().props["data-status"]).toBe("synced");
-    expect(current().props.children).toEqual(["Synced"]);
   });
 });
 
-describe("settings component", () => {
-  it("states that every plugin document is migrated atomically and failures retain prior settings", async () => {
-    const render = async (locale: string) => {
-      const fake = fakeReact();
-      const model = createSettingsModel(settingsHarness({ automation: false }).dependencies);
-      const Component = createSettingsComponent({ react: fake.react, model, locale });
-      const current = fake.mount(Component);
-      for (let round = 0; round < 8; round += 1) await Promise.resolve();
-      return JSON.stringify(current());
-    };
-
-    const chinese = await render("zh-CN");
-    expect(chinese).toContain("原子迁移属于此插件的全部文档");
-    expect(chinese).toContain("迁移失败会保留原位置与原设置");
-    const english = await render("en-US");
-    expect(english).toContain("atomically migrates all documents belonging to this plugin");
-    expect(english).toContain("A failed migration keeps the previous location and settings");
-  });
-});

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createEmptyEnvelope } from "../src/protocol/schema";
 import { ClientContextCoordinator, type CoordinatorClock } from "../src/coordinator/coordinator";
-import type { BeforeTurnEvent, DocumentStorage, InternalMessageEvent, PluginContext } from "../src/sdk";
+import type { BeforeTurnEvent, DocumentStorage, InternalMessageEvent, PluginContext, TurnHooks } from "../src/sdk";
 
 class MemoryDocuments implements DocumentStorage {
   readonly files = new Map<string, { content: string; version: string }>();
@@ -51,9 +51,11 @@ function harness(metadata: TestWorkspaceMetadata = workspace) {
   const documents = new MemoryDocuments();
   const registered: { session?: unknown; turn?: unknown; runtimeSwitch?: unknown } = {};
   const disposed: string[] = [];
+  const statuses: string[] = [];
+  const getMetadata = vi.fn(async () => metadata);
   const context = {
     documentStorage: documents,
-    workspace: { getMetadata: async () => metadata },
+    workspace: { getMetadata },
     hooks: {
       registerSessionHooks(hooks: unknown) { registered.session = hooks; return () => { disposed.push("session"); }; },
       registerTurnHooks(hooks: unknown) { registered.turn = hooks; return () => { disposed.push("turn"); }; },
@@ -67,8 +69,20 @@ function harness(metadata: TestWorkspaceMetadata = workspace) {
     setTimeout: (callback) => { timeout = callback; return 1; },
     clearTimeout: () => { timeout = undefined; },
   };
-  const coordinator = new ClientContextCoordinator(context, { clock, ttlDays: () => 7 });
-  return { coordinator, documents, registered, disposed, fireRecovery: () => timeout?.(), recoveryArmed: () => timeout !== undefined };
+  const offWorkspaces = new Set<string>();
+  const coordinator = new ClientContextCoordinator(context, { clock, ttlDays: () => 7, workspaceEnabled: (workspaceId) => !offWorkspaces.has(workspaceId), onStatus: (status) => { statuses.push(status); } });
+  return {
+    coordinator,
+    documents,
+    registered,
+    disposed,
+    statuses,
+    getMetadata,
+    fireRecovery: () => timeout?.(),
+    recoveryArmed: () => timeout !== undefined,
+    turnOff: (workspaceId: string) => { offWorkspaces.add(workspaceId); },
+    turnOn: (workspaceId: string) => { offWorkspaces.delete(workspaceId); },
+  };
 }
 
 function deferred() {
@@ -191,7 +205,7 @@ describe("client context coordinator", () => {
     const hooks = h.registered.turn as { onRuntimeEvent(event: unknown): void; afterTurn(event: unknown): Promise<void> };
     hooks.onRuntimeEvent({ ...turn, eventId: "e1", workspaceId: workspace.id, workspacePath: workspace.path, kind: "file-changed", path: "src/awaited.ts", change: "modified" });
     const settled = hooks.afterTurn({ ...turn, status: "completed" });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(h.documents.reads).toBe(1));
     expect(h.documents.writes).toBe(0);
     gate.resolve();
     await settled;
@@ -513,5 +527,325 @@ describe("client context coordinator", () => {
     const saved = JSON.parse(h.documents.files.get(`${workspace.id}.ccb`)!.content) as { changes: { files: Array<{ path: string }> }; provenance: { degradedReasons: string[] } };
     expect(saved.changes.files.map((file) => file.path)).toContain("src/invalid-frame.ts");
     expect(saved.provenance.degradedReasons).toContain("semantic-update-missing");
+  });
+
+  it("skips a workspace the owner turned off while the other workspace keeps bridging", async () => {
+    const other = { id: "workspace-2", path: "C:/other" };
+    const h = harness();
+    for (const id of [workspace.id, other.id]) {
+      const envelope = createEmptyEnvelope({ workspaceId: id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+      envelope.task.acceptance.push({ id: "acceptance-a1", text: `Stored goal of ${id}`, source: "agent-reported", updatedAt: turn.occurredAt });
+      h.documents.files.set(`${id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    }
+    h.coordinator.enable();
+    h.turnOff(workspace.id);
+    const hooks = h.registered.turn as {
+      beforeTurn(event: typeof turn): Promise<{ promptContributions?: TestContribution[] } | void>;
+      onRuntimeEvent(event: unknown): void;
+      afterTurn(event: unknown): Promise<void>;
+    };
+
+    const offResult = await hooks.beforeTurn(turn);
+    expect(offResult).toBeUndefined();
+    hooks.onRuntimeEvent({ ...turn, eventId: "e1", workspaceId: workspace.id, workspacePath: workspace.path, kind: "file-changed", path: "src/off.ts", change: "modified" });
+    await hooks.afterTurn({ ...turn, status: "completed" });
+    expect(h.documents.writes).toBe(0);
+    expect(h.documents.files.get(`${workspace.id}.ccb`)!.version).toBe("1");
+
+    const onTurn = { ...turn, turnId: "turn-2", workspace: other };
+    const onResult = await hooks.beforeTurn(onTurn);
+    expect(onResult?.promptContributions?.some((entry) => entry.content.includes("语义 patch"))).toBe(true);
+    hooks.onRuntimeEvent({ ...onTurn, eventId: "e2", workspaceId: other.id, workspacePath: other.path, kind: "file-changed", path: "src/on.ts", change: "modified" });
+    await hooks.afterTurn({ ...onTurn, status: "completed" });
+    expect(h.documents.writes).toBe(1);
+    const saved = JSON.parse(h.documents.files.get(`${other.id}.ccb`)!.content) as { changes: { files: Array<{ path: string }> } };
+    expect(saved.changes.files.map((file) => file.path)).toEqual(["src/on.ts"]);
+  });
+
+  it("offers no handoff and observes no switch for a workspace that is turned off", async () => {
+    const h = harness();
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.revision = 4;
+    envelope.task.goal = "Continue the migration";
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    h.coordinator.enable();
+    h.turnOff(workspace.id);
+    const switchHooks = h.registered.runtimeSwitch as { beforeSwitch(event: unknown): Promise<void>; afterSwitch(event: unknown): void };
+    const turnHooks = h.registered.turn as { beforeTurn(event: typeof turn): Promise<{ promptContributions?: TestContribution[] } | void> };
+    await switchHooks.beforeSwitch(switchEvent);
+    switchHooks.afterSwitch(switchEvent);
+    const result = await turnHooks.beforeTurn({ ...turn, turnId: "turn-2", engine: "codex", sessionId: null });
+    expect(result).toBeUndefined();
+    expect(h.documents.writes).toBe(0);
+  });
+
+  it("drops the draft and the in-flight turn of a workspace that is switched off", async () => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as {
+      beforeTurn(event: typeof turn): Promise<unknown>;
+      onInternalMessage(event: InternalMessageEvent): void;
+      onRuntimeEvent(event: unknown): void;
+      afterTurn(event: unknown): Promise<void>;
+    };
+    await hooks.beforeTurn(turn);
+    hooks.onInternalMessage({ ...turn, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { goal: "Recorded before the switch off" } }) });
+    hooks.onRuntimeEvent({ ...turn, eventId: "e1", workspaceId: workspace.id, workspacePath: workspace.path, kind: "file-changed", path: "src/dropped.ts", change: "modified" });
+    await vi.waitFor(() => expect(h.recoveryArmed()).toBe(true));
+
+    // What the owner's menu entry does: stop this workspace, then purge it.
+    h.turnOff(workspace.id);
+    h.coordinator.purgeDrafts([`${workspace.id}.ccb`]);
+    h.fireRecovery();
+    await hooks.afterTurn({ ...turn, status: "completed" });
+    expect(h.documents.writes).toBe(0);
+    expect(h.documents.files.has(`${workspace.id}.ccb`)).toBe(false);
+  });
+
+  it("permanently revokes an already returned result when its workspace is deactivated", async () => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as TurnHooks;
+    const first = await hooks.beforeTurn!(turn);
+    expect(first?.isCurrent?.()).toBe(true);
+    h.turnOff(workspace.id);
+    await h.coordinator.deactivateWorkspace(workspace.id);
+    h.turnOn(workspace.id);
+    const next = await hooks.beforeTurn!({ ...turn, runId: "new-run", turnId: "new-turn" });
+    expect(first?.isCurrent?.()).toBe(false);
+    expect(next?.isCurrent?.()).toBe(true);
+    h.coordinator.disable();
+    expect(next?.isCurrent?.()).toBe(false);
+  });
+
+  it("contributes nothing when the workspace goes off while beforeTurn is reading its document", async () => {
+    const h = harness();
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.task.acceptance.push({ id: "acceptance-a1", text: "Stored acceptance", source: "agent-reported", updatedAt: turn.occurredAt });
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    h.coordinator.enable();
+    const hooks = h.registered.turn as { beforeTurn(event: typeof turn): Promise<{ promptContributions?: TestContribution[] } | void>; afterTurn(event: unknown): Promise<void> };
+    const gate = deferred();
+    h.documents.blockFirstRead = () => gate.promise;
+
+    const pending = hooks.beforeTurn(turn);
+    await vi.waitFor(() => expect(h.documents.reads).toBe(1));
+    // The owner switches this workspace off mid-read.
+    h.turnOff(workspace.id);
+    await h.coordinator.deactivateWorkspace(workspace.id);
+    gate.resolve();
+    expect(await pending).toBeUndefined();
+
+    // The late read must not have installed a draft that a settle could write.
+    await hooks.afterTurn({ ...turn, status: "completed" });
+    expect(h.documents.writes).toBe(0);
+    expect(h.documents.files.get(`${workspace.id}.ccb`)!.version).toBe("1");
+  });
+
+  it("reads no document for a queued runtime event whose workspace went off before it ran", async () => {
+    const h = harness();
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt })), version: "1" });
+    h.coordinator.enable();
+    const hooks = h.registered.turn as { onRuntimeEvent(event: unknown): void; afterTurn(event: unknown): Promise<void> };
+    const gate = deferred();
+    h.documents.blockFirstRead = () => gate.promise;
+
+    // Two events queue behind one blocked read; the workspace goes off while
+    // the first is still in flight, so the second must never read at all.
+    hooks.onRuntimeEvent({ ...turn, eventId: "e1", workspaceId: workspace.id, workspacePath: workspace.path, kind: "file-changed", path: "src/first.ts", change: "modified" });
+    hooks.onRuntimeEvent({ ...turn, eventId: "e2", workspaceId: workspace.id, workspacePath: workspace.path, kind: "file-changed", path: "src/second.ts", change: "modified" });
+    await vi.waitFor(() => expect(h.documents.reads).toBe(1));
+    h.turnOff(workspace.id);
+    gate.resolve();
+    await h.coordinator.deactivateWorkspace(workspace.id);
+    expect(h.documents.reads).toBe(1);
+
+    await hooks.afterTurn({ ...turn, status: "completed" });
+    expect(h.documents.reads).toBe(1);
+    expect(h.documents.writes).toBe(0);
+    expect(h.recoveryArmed()).toBe(false);
+  });
+
+  it.each(["workspace", "global"] as const)("starts no document read when %s disable interrupts beforeTurn metadata", async (scope) => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as { beforeTurn(event: typeof turn): Promise<unknown> };
+    const started = deferred();
+    const gate = deferred();
+    h.getMetadata.mockImplementationOnce(async () => { started.resolve(); await gate.promise; return workspace; });
+
+    const pending = hooks.beforeTurn(turn);
+    await started.promise;
+    if (scope === "global") h.coordinator.disable();
+    else {
+      h.turnOff(workspace.id);
+      await h.coordinator.deactivateWorkspace(workspace.id);
+    }
+    gate.resolve();
+
+    expect(await pending).toBeUndefined();
+    expect(h.documents.reads).toBe(0);
+    expect(h.documents.writes).toBe(0);
+  });
+
+  it.each(["workspace", "global"] as const)("discards an old semantic patch across %s disable and re-enable during afterTurn metadata", async (scope) => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as {
+      beforeTurn(event: typeof turn): Promise<unknown>;
+      onInternalMessage(event: InternalMessageEvent): void;
+      afterTurn(event: unknown): Promise<void>;
+    };
+    await hooks.beforeTurn(turn);
+    hooks.onInternalMessage({ ...turn, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { goal: "Discard this old patch" } }) });
+    const started = deferred();
+    const gate = deferred();
+    h.getMetadata.mockImplementationOnce(async () => { started.resolve(); await gate.promise; return workspace; });
+    const pending = hooks.afterTurn({ ...turn, status: "completed" });
+    await started.promise;
+
+    if (scope === "global") h.coordinator.disable();
+    else {
+      h.turnOff(workspace.id);
+      await h.coordinator.deactivateWorkspace(workspace.id);
+    }
+    const external = createEmptyEnvelope({ workspaceId: workspace.id, engine: "codex", turnStatus: "completed", now: turn.occurredAt });
+    external.task.goal = "Keep the other client's goal";
+    const document = { content: JSON.stringify(external), version: "external" };
+    h.documents.files.set(`${workspace.id}.ccb`, document);
+    const readsBeforeResume = h.documents.reads;
+    if (scope === "global") h.coordinator.enable();
+    else h.turnOn(workspace.id);
+    gate.resolve();
+    await pending;
+
+    expect(h.documents.reads).toBe(readsBeforeResume);
+    expect(h.documents.writes).toBe(0);
+    expect(h.documents.files.get(`${workspace.id}.ccb`)).toEqual(document);
+    const resumed = h.registered.turn as typeof hooks;
+    await resumed.beforeTurn({ ...turn, turnId: "fresh-turn" });
+    await resumed.afterTurn({ ...turn, turnId: "fresh-turn", status: "completed" });
+    expect(JSON.parse(h.documents.files.get(`${workspace.id}.ccb`)!.content).task.goal).toBe(external.task.goal);
+  });
+
+  it("does not restore a discarded switch handoff when its pending write finishes after workspace disable", async () => {
+    const h = harness();
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.revision = 4;
+    envelope.task.goal = "Discard this switch handoff";
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "original" });
+    h.coordinator.enable();
+    const hooks = h.registered.turn as { beforeTurn(event: typeof turn): Promise<{ promptContributions?: TestContribution[] } | void>; onRuntimeEvent(event: unknown): void };
+    hooks.onRuntimeEvent({ ...turn, eventId: "e1", workspaceId: workspace.id, workspacePath: workspace.path, kind: "file-changed", path: "src/pending.ts", change: "modified" });
+    await vi.waitFor(() => expect(h.recoveryArmed()).toBe(true));
+    const started = deferred();
+    const gate = deferred();
+    const write = h.documents.writeTextAtomic.bind(h.documents);
+    vi.spyOn(h.documents, "writeTextAtomic").mockImplementationOnce(async (...args) => { started.resolve(); await gate.promise; return write(...args); });
+    const switches = h.registered.runtimeSwitch as { beforeSwitch(event: unknown): Promise<void>; afterSwitch(event: unknown): void };
+    const pending = switches.beforeSwitch(switchEvent);
+    await started.promise;
+
+    h.turnOff(workspace.id);
+    await h.coordinator.deactivateWorkspace(workspace.id);
+    const statusesBeforeRelease = [...h.statuses];
+    gate.resolve();
+    await pending;
+    expect(h.statuses).toEqual(statusesBeforeRelease);
+    switches.afterSwitch(switchEvent);
+    h.turnOn(workspace.id);
+
+    const result = await hooks.beforeTurn({ ...turn, turnId: "target-turn", engine: "codex" });
+    expect(result?.promptContributions?.some((entry) => entry.id === "ccb-handoff")).toBe(false);
+  });
+
+  it("starts no conflict reload or follow-up write after a pending settle write is disabled", async () => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as { beforeTurn(event: typeof turn): Promise<unknown>; onInternalMessage(event: InternalMessageEvent): void; afterTurn(event: unknown): Promise<void> };
+    await hooks.beforeTurn(turn);
+    hooks.onInternalMessage({ ...turn, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { goal: "Stale local goal" } }) });
+    const started = deferred();
+    const gate = deferred();
+    const write = h.documents.writeTextAtomic.bind(h.documents);
+    const writes = vi.spyOn(h.documents, "writeTextAtomic").mockImplementationOnce(async (...args) => { started.resolve(); await gate.promise; return write(...args); });
+    const pending = hooks.afterTurn({ ...turn, status: "completed" });
+    await started.promise;
+    const readsBeforeDisable = h.documents.reads;
+    h.turnOff(workspace.id);
+    const disabled = h.coordinator.deactivateWorkspace(workspace.id);
+    const external = createEmptyEnvelope({ workspaceId: workspace.id, engine: "codex", turnStatus: "completed", now: turn.occurredAt });
+    external.task.goal = "Other client's latest goal";
+    const document = { content: JSON.stringify(external), version: "external" };
+    h.documents.files.set(`${workspace.id}.ccb`, document);
+    const statusesBeforeRelease = [...h.statuses];
+    gate.resolve();
+    await Promise.all([pending, disabled]);
+    expect(h.statuses).toEqual(statusesBeforeRelease);
+
+    expect(h.documents.reads).toBe(readsBeforeDisable);
+    expect(writes).toHaveBeenCalledTimes(1);
+    expect(h.documents.writes).toBe(0);
+    expect(h.documents.files.get(`${workspace.id}.ccb`)).toEqual(document);
+    expect([...h.documents.files.keys()]).toEqual([`${workspace.id}.ccb`]);
+  });
+
+  it("does not let a maintenance force flush survive global disable and re-enable", async () => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as { onRuntimeEvent(event: unknown): void };
+    hooks.onRuntimeEvent({ ...turn, eventId: "e1", workspaceId: workspace.id, workspacePath: workspace.path, kind: "file-changed", path: "src/stale.ts", change: "modified" });
+    await vi.waitFor(() => expect(h.recoveryArmed()).toBe(true));
+    const started = deferred();
+    const gate = deferred();
+    const write = h.documents.writeTextAtomic.bind(h.documents);
+    const writes = vi.spyOn(h.documents, "writeTextAtomic").mockImplementationOnce(async (...args) => { started.resolve(); await gate.promise; return write(...args); });
+    const pending = h.coordinator.pauseForMaintenance();
+    await started.promise;
+    const readsBeforeDisable = h.documents.reads;
+    h.coordinator.disable();
+    const external = createEmptyEnvelope({ workspaceId: workspace.id, engine: "codex", turnStatus: "completed", now: turn.occurredAt });
+    external.task.goal = "External maintenance update";
+    const document = { content: JSON.stringify(external), version: "external" };
+    h.documents.files.set(`${workspace.id}.ccb`, document);
+    h.coordinator.enable();
+    const statusesBeforeRelease = [...h.statuses];
+    gate.resolve();
+    await pending;
+    expect(h.statuses).toEqual(statusesBeforeRelease);
+
+    expect(h.documents.reads).toBe(readsBeforeDisable);
+    expect(writes).toHaveBeenCalledTimes(1);
+    expect(h.documents.writes).toBe(0);
+    expect(h.documents.files.get(`${workspace.id}.ccb`)).toEqual(document);
+  });
+
+  it("reloads the document instead of a stale draft when a workspace is turned back on", async () => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as {
+      beforeTurn(event: typeof turn): Promise<{ promptContributions?: TestContribution[] } | void>;
+      onInternalMessage(event: InternalMessageEvent): void;
+      afterTurn(event: unknown): Promise<void>;
+    };
+    await hooks.beforeTurn(turn);
+    hooks.onInternalMessage({ ...turn, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ append: { acceptance: ["Never persisted"] } }) });
+    h.turnOff(workspace.id);
+    await h.coordinator.deactivateWorkspace(workspace.id);
+
+    // A document written by another client while this workspace was off.
+    const external = createEmptyEnvelope({ workspaceId: workspace.id, engine: "codex", turnStatus: "completed", now: turn.occurredAt });
+    external.task.acceptance.push({ id: "acceptance-ext", text: "Written elsewhere", source: "agent-reported", updatedAt: turn.occurredAt });
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(external), version: "1" });
+
+    h.turnOn(workspace.id);
+    const resumed = await hooks.beforeTurn({ ...turn, turnId: "turn-2" });
+    const protocol = resumed?.promptContributions?.find((entry) => entry.id === "ccb-protocol-turn-2")?.content ?? "";
+    expect(protocol).toContain("acceptance-ext");
+    expect(protocol).not.toContain("Never persisted");
+
+    await hooks.afterTurn({ ...turn, turnId: "turn-2", status: "completed" });
+    const saved = JSON.parse(h.documents.files.get(`${workspace.id}.ccb`)!.content) as { task: { acceptance: Array<{ text: string }> } };
+    expect(saved.task.acceptance.map((item) => item.text)).toEqual(["Written elsewhere"]);
   });
 });
