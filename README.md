@@ -9,9 +9,9 @@ CCGUI 市场插件。在不同 AI CLI 客户端（Claude Code / Codex CLI / Gemi
 - 上下文文件：`<ccgui-data>/plugin-data/ccgui.client-context-bridge/<workspace-id>.ccb`（UTF-8 JSON）
 - 插件不引入 SQLite 或 Protobuf；宿主对各 CLI 原生历史格式的读取与 `.ccb` 存储独立。
 
-## 硬性前提：需要 SDK 0.4.1 或更高版本的宿主
+## 硬性前提：需要 SDK 0.4.2 或更高版本的宿主
 
-本插件 `manifest.json` 声明 `sdkVersion: ">=0.4.1"`。宿主 SDK 版本不足时，插件管理会拒绝加载；
+本插件 `manifest.json` 声明 `sdkVersion: ">=0.4.2"`。宿主 SDK 版本不足时，插件管理会拒绝加载；
 仅升级 AI CLI 不能补齐宿主接口。
 
 需要配套的宿主构建：`desktop-cc-gui` 分支 `feat/client-context-bridge` 的 Windows 产物
@@ -21,12 +21,12 @@ CCGUI 市场插件。在不同 AI CLI 客户端（Claude Code / Codex CLI / Gemi
 |---|---|
 | `ctx.hooks.registerSessionHooks` | 观察会话新建、恢复与关闭 |
 | `ctx.hooks.registerTurnHooks` | 观察运行时事实与回合结算；以稳定 `turnId` 关联 |
-| `ctx.hooks.registerRuntimeSwitchHooks` | 观察客户端切换前后生命周期 |
-| `TurnHooks.beforeTurn` 返回内部 `PromptContribution` | 启动成功后才确认接纳，不把失败发送记为已消费 |
+| `ctx.hooks.registerRuntimeSwitchHooks` | 以稳定 `switchId` 关联客户端切换，拒绝旧生命周期的迟到完成 |
+| `TurnHooks.beforeTurn` 返回内部 `PromptContribution` | 启动成功后、回合结算前确认接纳，不把失败发送记为已消费 |
 | `ctx.documentStorage` | 受控 UTF-8 JSON 文档存储（原子写、备份、CAS） |
 | `ctx.workspace.getMetadata()` | 只读工作区身份与 Git 元数据 |
 | `ctx.ui.registerWorkspaceMenuItem` | 在目标工作区右键菜单中单独启用或停用桥接 |
-| `BeforeTurnResult.isCurrent` | 工作区停用后撤销已返回、尚未发送的协议与交接 |
+| `BeforeTurnResult.isCurrent` | 工作区停用后撤销未发送的提示、内部帧捕获与投递 |
 
 这些都是领域通用接口，宿主里没有任何 CCB 专属类型或状态机。
 

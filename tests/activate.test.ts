@@ -72,7 +72,7 @@ function activationHarness(initialAutomation = false, initialLocation: "data" | 
       delete: async (key: string) => { storage.delete(key); },
     },
     events: { on: () => () => {}, emit: (_topic: string, data: unknown) => { emitted.push(data); } },
-    host: { appVersion: "1.0.0", sdkVersion: "0.4.1", locale: "en-US", isWeb: false },
+    host: { appVersion: "1.0.0", sdkVersion: "0.4.2", locale: "en-US", isWeb: false },
   } as unknown as PluginContext;
   const cleanup = activate(context);
   return {

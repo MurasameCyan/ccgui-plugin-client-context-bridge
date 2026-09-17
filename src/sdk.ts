@@ -42,6 +42,7 @@ export interface BeforeTurnEvent extends TurnEventBase {}
 export interface AfterTurnEvent extends TurnEventBase { status: "completed" | "cancelled" | "failed"; error?: string }
 export interface InternalMessageEvent extends TurnEventBase { channel: string; nonce?: string; payload: unknown }
 export interface RuntimeSwitchEvent {
+  switchId: string;
   sourceEngine: string;
   targetEngine: string;
   sourceSessionId: string | null;

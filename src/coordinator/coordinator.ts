@@ -62,11 +62,14 @@ interface DraftState {
 }
 
 interface TurnState {
-  nonce: string;
+  /** Observed-only turns have no authority to submit a semantic frame. */
+  nonce?: string;
   /** Owning workspace, so turning one workspace off can drop exactly its turns. */
   workspaceId: string;
   /** undefined = no internal frame arrived; null = frame arrived but invalid; otherwise the parsed patch. */
   patch: SemanticPatch | null | undefined;
+  /** Keep receipt ownership even after another switch becomes current. */
+  handoff?: PendingHandoff;
 }
 
 /** The accepted target turn. `turnId` is the only stable correlation key: the
@@ -80,6 +83,7 @@ interface AcceptedHandoff {
 }
 
 interface PendingHandoff {
+  switchId: string;
   sourceEngine: string;
   targetEngine: string;
   workspaceId: string;
@@ -279,7 +283,7 @@ export class ClientContextCoordinator {
 
     const metadata = await this.context.workspace.getMetadata();
     if (!isCurrent()) return;
-    const handoff = await this.getHandoff(event, isCurrent, metadata.gitHead);
+    const handoff = await this.getHandoff(event, isCurrent, lifetime, metadata.gitHead);
     if (!isCurrent()) return;
     if (handoff) promptContributions.push(handoff);
 
@@ -300,7 +304,7 @@ export class ClientContextCoordinator {
     return { promptContributions, internalMessageCapture: { channel: CHANNEL, nonce, maxBytes: MAX_PATCH_BYTES, validate: isCompleteInternalFrame }, isCurrent: lifetime };
   }
 
-  private async getHandoff(event: BeforeTurnEvent, isCurrent: () => boolean, currentGitHead?: string): Promise<PromptContribution | undefined> {
+  private async getHandoff(event: BeforeTurnEvent, isCurrent: () => boolean, lifetime: () => boolean, currentGitHead?: string): Promise<PromptContribution | undefined> {
     const pending = this.pendingHandoff;
     if (!isCurrent()) return undefined;
     if (!pending || pending.restored || pending.sourceEngine === pending.targetEngine || event.engine !== pending.targetEngine || event.workspace.id !== pending.workspaceId || pending.accepted.size > 0) return undefined;
@@ -317,10 +321,13 @@ export class ClientContextCoordinator {
       const compiled = compileHandoff(stored.envelope, { now: event.occurredAt, ttlDays: this.ttlDays(), currentGitHead });
       if (!compiled.eligible) return undefined;
       const revision = stored.envelope.revision;
+      const turn = this.turns.get(event.turnId);
+      if (!turn) return undefined;
+      turn.handoff = pending;
       return {
         id: "ccb-handoff", content: compiled.content, placement: "request-tail" as const, visibility: "internal" as const, persistence: "turn" as const,
         onAccepted: () => {
-          if (!isCurrent() || this.pendingHandoff !== pending) return;
+          if (!lifetime()) return;
           pending.accepted.set(event.turnId, { revision, turnId: event.turnId, ...(event.sessionId ? { targetSessionId: event.sessionId } : {}) });
           this.onStatus("continued");
         },
@@ -345,6 +352,7 @@ export class ClientContextCoordinator {
     if (!isCurrent()) return;
     const draft = await this.ensureDraft(event.workspaceId, event.engine, event.occurredAt, isCurrent);
     if (!draft || !isCurrent()) return;
+    if (!this.turns.has(event.turnId)) this.turns.set(event.turnId, { workspaceId: event.workspaceId, patch: undefined });
     const facts: HostFacts = { source: { engine: event.engine, nativeSessionId: event.sessionId ?? undefined, turnId: event.turnId } };
     if (event.kind === "file-changed") facts.changedFiles = [{ path: event.path, change: event.change, observedAt: event.occurredAt }];
     if (event.kind === "command-started") {
@@ -379,7 +387,7 @@ export class ClientContextCoordinator {
     void this.enqueue(event.turnId, async () => {
       if (!isCurrent()) return;
       const turn = this.turns.get(event.turnId);
-      if (!turn || turn.nonce !== event.nonce) return;
+      if (!turn?.nonce || turn.nonce !== event.nonce) return;
       try {
         turn.patch = this.extractPatch(event.payload);
       } catch {
@@ -402,7 +410,9 @@ export class ClientContextCoordinator {
     const isCurrent = this.captureLifetime(event.workspace.id);
     await this.drainTurn(event.turnId);
     if (!isCurrent()) return;
-    const patch = this.turns.get(event.turnId)?.patch;
+    const turn = this.turns.get(event.turnId);
+    if (!turn || turn.workspaceId !== event.workspace.id) return;
+    const patch = turn.patch;
     this.turns.delete(event.turnId);
     this.settleSessionIdentity(event);
     const metadata = await this.context.workspace.getMetadata();
@@ -420,7 +430,7 @@ export class ClientContextCoordinator {
           ...(metadata.dirty !== undefined ? { dirty: metadata.dirty } : {}),
         },
       };
-      const accepted = this.acceptedHandoffFor(event);
+      const accepted = this.acceptedHandoffFor(event, turn.handoff);
       // Only the session that actually ran this turn may be recorded. A turn
       // whose own native id never materialised has no session to file the row
       // against, and `pendingHandoff` follows any session of the target engine
@@ -438,31 +448,21 @@ export class ClientContextCoordinator {
   private async beforeSwitch(event: RuntimeSwitchEvent): Promise<void> {
     if (!this.isActive(event.workspace.id)) return;
     const isCurrent = this.captureLifetime(event.workspace.id);
+    this.pendingHandoff = event.sourceEngine === event.targetEngine ? undefined : this.createPendingHandoff(event);
     await this.flush(event.workspace.id, isCurrent);
-    if (!isCurrent()) return;
-    if (event.sourceEngine === event.targetEngine) {
-      this.pendingHandoff = undefined;
-      return;
-    }
-    this.pendingHandoff = this.createPendingHandoff(event);
   }
 
   private afterSwitch(event: RuntimeSwitchEvent): void {
-    if (!this.workspaceEnabled(event.workspace.id)) return;
-    if (!this.enabled || event.sourceEngine === event.targetEngine) {
-      this.pendingHandoff = undefined;
-      return;
-    }
+    if (!this.isActive(event.workspace.id)) return;
     const existing = this.pendingHandoff;
-    if (existing && existing.sourceEngine === event.sourceEngine && existing.targetEngine === event.targetEngine && existing.workspaceId === event.workspace.id) {
+    if (existing && existing.switchId === event.switchId && existing.sourceEngine === event.sourceEngine && existing.targetEngine === event.targetEngine && existing.workspaceId === event.workspace.id) {
       if (event.targetSessionId && !existing.restored) existing.restored = true;
-      return;
     }
-    this.pendingHandoff = this.createPendingHandoff(event);
   }
 
   private createPendingHandoff(event: RuntimeSwitchEvent): PendingHandoff {
     return {
+      switchId: event.switchId,
       sourceEngine: event.sourceEngine,
       targetEngine: event.targetEngine,
       workspaceId: event.workspace.id,
@@ -595,8 +595,7 @@ export class ClientContextCoordinator {
     if (event.sessionId) this.initializedSessions.add(this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id));
   }
 
-  private acceptedHandoffFor(event: AfterTurnEvent): AcceptedHandoff | undefined {
-    const pending = this.pendingHandoff;
+  private acceptedHandoffFor(event: AfterTurnEvent, pending: PendingHandoff | undefined): AcceptedHandoff | undefined {
     if (!pending || pending.targetEngine !== event.engine || pending.workspaceId !== event.workspace.id) return undefined;
     return pending.accepted.get(event.turnId);
   }

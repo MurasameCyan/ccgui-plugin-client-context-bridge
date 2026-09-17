@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createEmptyEnvelope } from "../src/protocol/schema";
 import { ClientContextCoordinator, type CoordinatorClock } from "../src/coordinator/coordinator";
-import type { BeforeTurnEvent, DocumentStorage, InternalMessageEvent, PluginContext, TurnHooks } from "../src/sdk";
+import type { BeforeTurnEvent, DocumentStorage, InternalMessageEvent, PluginContext, RuntimeSwitchHooks, TurnHooks } from "../src/sdk";
 
 class MemoryDocuments implements DocumentStorage {
   readonly files = new Map<string, { content: string; version: string }>();
@@ -94,10 +94,119 @@ function deferred() {
 const workspace = { id: "workspace-1", path: "C:/repo" };
 const turn: BeforeTurnEvent = { runId: "run-1", turnId: "turn-1", engine: "claude", sessionId: null, workspace, occurredAt: "2026-09-13T10:00:00.000Z" };
 const NONCE = "4d6f62f86b3097d487489d19c8628599";
-const switchEvent = { sourceEngine: "claude", targetEngine: "codex", sourceSessionId: "c1", targetSessionId: null, workspace, occurredAt: turn.occurredAt };
+const switchEvent = { switchId: "switch-1", sourceEngine: "claude", targetEngine: "codex", sourceSessionId: "c1", targetSessionId: null, workspace, occurredAt: turn.occurredAt };
 const internalFrame = (patch: unknown) => ({ plugin: "ccgui.client-context-bridge", version: 1, patch });
 
 describe("client context coordinator", () => {
+  it("keeps receipt ownership when a newer client switch replaces the pending handoff", async () => {
+    const h = harness();
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.task.goal = "Continue both accepted targets";
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    h.coordinator.enable();
+    const switches = h.registered.runtimeSwitch as RuntimeSwitchHooks;
+    const hooks = h.registered.turn as TurnHooks;
+    await switches.beforeSwitch!(switchEvent);
+    const first = { ...turn, engine: "codex", turnId: "first-turn" };
+    const firstResult = await hooks.beforeTurn!(first);
+    await switches.beforeSwitch!({ ...switchEvent, switchId: "second-switch", sourceEngine: "codex", targetEngine: "omp" });
+    const second = { ...turn, engine: "omp", turnId: "second-turn" };
+    const secondResult = await hooks.beforeTurn!(second);
+    firstResult?.promptContributions?.find((entry) => entry.id === "ccb-handoff")?.onAccepted?.();
+    secondResult?.promptContributions?.find((entry) => entry.id === "ccb-handoff")?.onAccepted?.();
+    await hooks.afterTurn!({ ...first, sessionId: "first-target", status: "completed" });
+    await hooks.afterTurn!({ ...second, sessionId: "second-target", status: "completed" });
+    const saved = JSON.parse(h.documents.files.get(`${workspace.id}.ccb`)!.content);
+    expect(saved.consumption.map((entry: { targetSessionId: string }) => entry.targetSessionId).sort()).toEqual(["first-target", "second-target"]);
+  });
+
+  it("persists a launch receipt accepted while normal turn settlement awaits metadata", async () => {
+    const h = harness();
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.revision = 4;
+    envelope.task.goal = "Continue the accepted task";
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    h.coordinator.enable();
+    const switches = h.registered.runtimeSwitch as RuntimeSwitchHooks;
+    const hooks = h.registered.turn as TurnHooks;
+    await switches.beforeSwitch!(switchEvent);
+    const target = { ...turn, engine: "codex" };
+    const collected = await hooks.beforeTurn!(target);
+    const handoff = collected?.promptContributions?.find((entry) => entry.id === "ccb-handoff");
+    expect(handoff).toBeDefined();
+    const started = deferred();
+    const gate = deferred();
+    h.getMetadata.mockImplementationOnce(async () => { started.resolve(); await gate.promise; return workspace; });
+    const settlement = hooks.afterTurn!({ ...target, sessionId: "receipt-target", status: "completed" });
+    await started.promise;
+    handoff!.onAccepted!();
+    gate.resolve();
+    await settlement;
+    const saved = JSON.parse(h.documents.files.get(`${workspace.id}.ccb`)!.content);
+    expect(saved.consumption).toEqual([expect.objectContaining({ targetEngine: "codex", targetSessionId: "receipt-target", consumedRevision: 4 })]);
+    expect(h.documents.writes).toBe(1);
+    const next = await hooks.beforeTurn!({ ...target, runId: "next-run", turnId: "next-turn", sessionId: "receipt-target" });
+    expect(next?.promptContributions?.some((entry) => entry.id === "ccb-handoff")).toBe(false);
+  });
+
+  it("does not recreate a retired switch after its workspace is re-enabled", async () => {
+    const h = harness();
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.task.goal = "Continue the accepted task";
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    h.coordinator.enable();
+    const switches = h.registered.runtimeSwitch as RuntimeSwitchHooks;
+    const hooks = h.registered.turn as TurnHooks;
+    await switches.beforeSwitch!(switchEvent);
+    const collected = await hooks.beforeTurn!({ ...turn, engine: "codex" });
+    expect(collected?.promptContributions?.some((entry) => entry.id === "ccb-handoff")).toBe(true);
+    h.turnOff(workspace.id);
+    await h.coordinator.deactivateWorkspace(workspace.id);
+    h.turnOn(workspace.id);
+    collected?.promptContributions?.find((entry) => entry.id === "ccb-handoff")?.onAccepted?.();
+    switches.afterSwitch!(switchEvent);
+    const next = await hooks.beforeTurn!({ ...turn, runId: "next-run", turnId: "next-turn", engine: "codex", sessionId: "old-target" });
+    expect(next?.promptContributions?.some((entry) => entry.id === "ccb-handoff")).toBe(false);
+  });
+
+  it("keeps a new switch eligible when an older restored-target switch completes", async () => {
+    const h = harness();
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.task.goal = "Continue the new target";
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    h.coordinator.enable();
+    const switches = h.registered.runtimeSwitch as RuntimeSwitchHooks;
+    const hooks = h.registered.turn as TurnHooks;
+    const oldSwitch = { ...switchEvent, switchId: "old-switch", targetSessionId: "restored-target" };
+    await switches.beforeSwitch!(oldSwitch);
+    h.turnOff(workspace.id);
+    await h.coordinator.deactivateWorkspace(workspace.id);
+    h.turnOn(workspace.id);
+    await switches.beforeSwitch!({ ...switchEvent, switchId: "new-switch" });
+    switches.afterSwitch!(oldSwitch);
+    const fresh = await hooks.beforeTurn!({ ...turn, engine: "codex" });
+    expect(fresh?.promptContributions?.some((entry) => entry.id === "ccb-handoff")).toBe(true);
+  });
+
+  it("does not settle a retired turn that finishes after workspace re-enable", async () => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as TurnHooks;
+    await hooks.beforeTurn!(turn);
+    h.turnOff(workspace.id);
+    await h.coordinator.deactivateWorkspace(workspace.id);
+    const latest = createEmptyEnvelope({ workspaceId: workspace.id, engine: "codex", turnStatus: "completed", now: turn.occurredAt });
+    latest.task.goal = "Keep the current task";
+    const document = { content: JSON.stringify(latest), version: "external" };
+    h.documents.files.set(`${workspace.id}.ccb`, document);
+    h.turnOn(workspace.id);
+    const reads = h.documents.reads;
+    await hooks.afterTurn!({ ...turn, sessionId: "old-session", status: "completed" });
+    expect(h.documents.files.get(`${workspace.id}.ccb`)).toBe(document);
+    expect(h.documents.reads).toBe(reads);
+    expect(h.documents.writes).toBe(0);
+  });
+
   it("does absolutely no operational registration or document I/O before enable", () => {
     const h = harness();
     expect(h.registered).toEqual({});
