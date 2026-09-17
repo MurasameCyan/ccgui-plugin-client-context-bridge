@@ -1,0 +1,43 @@
+name: Test and package plugin
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Package installable plugin
+        shell: bash
+        run: |
+          version=$(node -p "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8')).version")
+          mkdir -p package/ccgui-plugin-client-context-bridge
+          cp dist/main.js dist/manifest.json README.md package/ccgui-plugin-client-context-bridge/
+          cd package
+          zip -r "ccgui-plugin-client-context-bridge-${version}.zip" ccgui-plugin-client-context-bridge
+          sha256sum "ccgui-plugin-client-context-bridge-${version}.zip" > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ccgui-plugin-client-context-bridge
+          path: |
+            package/*.zip
+            package/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
