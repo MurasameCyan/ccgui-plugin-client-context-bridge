@@ -124,8 +124,8 @@ export class ClientContextCoordinator {
   private pendingHandoff: PendingHandoff | undefined;
   /** Bumped on every disable, so a read in flight across a restart is stale. */
   private epoch = 0;
-  /** Per-workspace invalidation counter. A document read that started before
-   *  the workspace was forgotten belongs to a state that no longer exists. */
+  /** Generations for every workspace that has owned session/turn state. A read
+   *  from before the workspace was forgotten belongs to a retired generation. */
   private readonly generations = new Map<string, number>();
 
   constructor(private readonly context: PluginContext, options: CoordinatorOptions) {
@@ -237,6 +237,18 @@ export class ClientContextCoordinator {
     }
   }
 
+  /** Retire only workspaces disabled by a changed global default. Explicitly
+   *  enabled workspaces retain their in-flight turns and handoff receipts. */
+  refreshWorkspaceEnablement(): void {
+    for (const workspaceId of this.generations.keys()) {
+      if (!this.workspaceEnabled(workspaceId)) this.forgetWorkspace(workspaceId);
+    }
+    if (this.recoveryTimer !== undefined && ![...this.drafts.values()].some((draft) => draft.dirty)) {
+      this.clock.clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = undefined;
+    }
+  }
+
   /** Forget everything held for one workspace and invalidate its pending reads. */
   private forgetWorkspace(workspaceId: string): void {
     this.generations.set(workspaceId, (this.generations.get(workspaceId) ?? 0) + 1);
@@ -246,9 +258,11 @@ export class ClientContextCoordinator {
     for (const [turnId, turn] of [...this.turns]) if (turn.workspaceId === workspaceId) this.turns.delete(turnId);
   }
 
-  /** Operational for this workspace: globally enabled and not turned off for it. */
+  /** Operational for this workspace, whether inherited or explicitly enabled. */
   private isActive(workspaceId: string): boolean {
-    return this.enabled && this.workspaceEnabled(workspaceId);
+    if (!this.enabled || !this.workspaceEnabled(workspaceId)) return false;
+    if (!this.generations.has(workspaceId)) this.generations.set(workspaceId, 0);
+    return true;
   }
 
   /** Keep the originating lifetime across queues, awaits, and nested storage I/O. */

@@ -12,10 +12,12 @@ interface HarnessOptions {
   gate?: Promise<void>;
   readStarted?(key: string): void;
   beforeWrite?(key: string, value: unknown): Promise<void>;
+  beforeRead?(path: string): Promise<void>;
 }
 
-function activationHarness(initialAutomation = false, initialLocation: "data" | "program" | "custom" = "data", options: HarnessOptions = {}) {
-  const storage = new Map<string, unknown>([["bridgeConfig", { automationEnabled: initialAutomation, location: initialLocation, ttlDays: 7 }]]);
+function activationHarness(initialAutomation: boolean | null = null, initialLocation: "data" | "program" | "custom" = "data", options: HarnessOptions = {}) {
+  const storage = new Map<string, unknown>();
+  if (initialAutomation !== null) storage.set("bridgeConfig", { automationEnabled: initialAutomation, location: initialLocation, ttlDays: 7 });
   if (options.overrides !== undefined) storage.set("workspaceOverrides", options.overrides);
   const registered = { settings: 0, status: 0, workspaceMenu: 0, session: 0, turn: 0, runtimeSwitch: 0, i18n: 0 };
   const calls = { selectLocation: 0, getLocation: 0 };
@@ -45,7 +47,7 @@ function activationHarness(initialAutomation = false, initialLocation: "data" | 
     documentStorage: {
       getLocation: async () => { calls.getLocation += 1; return { kind: "data" as const, path: "C:/data" }; },
       selectLocation: async (kind: "data" | "program" | "custom") => { calls.selectLocation += 1; return { kind, path: "C:/data" }; },
-      readText: async (path: string) => { documentReads.push(path); return null; },
+      readText: async (path: string) => { documentReads.push(path); await options.beforeRead?.(path); return null; },
       writeTextAtomic: async () => ({ version: "1" }),
       remove: async () => {},
       list: async () => [],
@@ -141,21 +143,30 @@ function findSwitch(tree: unknown): SwitchControl | undefined {
 }
 
 describe("plugin activation", () => {
-  it("always registers settings, status and i18n but leaves operations off by default", async () => {
-    const harness = activationHarness(false);
-    await Promise.resolve();
-    expect(harness.registered).toEqual({ settings: 1, status: 1, workspaceMenu: 1, session: 0, turn: 0, runtimeSwitch: 0, i18n: 2 });
-    expect(harness.settingsComponent).toBeTypeOf("function");
-    expect(harness.statusComponent).toBeTypeOf("function");
+  it("keeps a fresh install and its unspecified workspaces inactive", async () => {
+    const harness = activationHarness();
+    const current = harness.mountSettings();
+    try {
+      await vi.waitFor(() => expect(findSwitch(current())?.checked).toBe(false));
+      expect(await harness.beforeTurn("w")).toBeUndefined();
+      expect(harness.documentReads).toEqual([]);
+      expect(harness.writes).toEqual([]);
+    } finally {
+      harness.cleanup();
+    }
   });
 
-  it("enables operations from persisted settings and cleans every registration", async () => {
+  it("revokes active contributions and refuses further work after unloading", async () => {
     const harness = activationHarness(true);
-    await vi.waitFor(() => expect(harness.registered.session).toBe(1));
-    expect(harness.registered.turn).toBe(1);
-    expect(harness.registered.runtimeSwitch).toBe(1);
-    harness.cleanup?.();
-    expect(harness.disposed).toEqual(expect.arrayContaining(["session", "turn", "switch", "settings", "status", "workspace-menu", "i18n"]));
+    await vi.waitFor(() => expect(harness.menu().visible?.({ workspaceId: "w", archived: false })).toBe(true));
+    const result = await harness.beforeTurn("w");
+    expect(result?.promptContributions).toEqual([expect.objectContaining({ visibility: "internal" })]);
+    expect(result?.isCurrent?.()).toBe(true);
+    harness.cleanup();
+    expect(result?.isCurrent?.()).toBe(false);
+    harness.documentReads.length = 0;
+    expect(await harness.beforeTurn("w", "after-unload")).toBeUndefined();
+    expect(harness.documentReads).toEqual([]);
   });
 
   it("ignores a legacy persisted location without selecting it during activation (P1)", async () => {
@@ -192,15 +203,97 @@ describe("plugin activation", () => {
     relaunched.cleanup();
   });
 
-  it("records workspace choices without enabling global operations", async () => {
+  it("enables only the selected workspace while the global default stays off", async () => {
     const harness = activationHarness(false);
-    await vi.waitFor(() => expect(harness.menu().visible?.({ workspaceId: "w1", archived: false })).toBe(true));
-    const menu = harness.menu();
-    menu.onSelect({ workspaceId: "w1", archived: false });
-    await vi.waitFor(() => expect(harness.storage.get("workspaceOverrides")).toEqual({ w1: false }));
-    // Recording a workspace choice never starts operations.
-    expect(harness.registered.session).toBe(0);
-    expect(harness.calls.getLocation).toBe(0);
+    const target = { workspaceId: "w1", archived: false };
+    try {
+      await vi.waitFor(() => expect(harness.menu().visible?.(target)).toBe(true));
+      const menu = harness.menu();
+      menu.label(target);
+      menu.onSelect(target);
+      await vi.waitFor(() => expect(harness.storage.get("workspaceOverrides")).toEqual({ w1: true }));
+      expect((await harness.beforeTurn("w1"))?.promptContributions).toEqual([expect.objectContaining({ visibility: "internal" })]);
+      expect(await harness.beforeTurn("w2", "other-workspace")).toBeUndefined();
+      expect(harness.documentReads).not.toContain("w2.ccb");
+      expect(harness.storage.get("bridgeConfig")).toEqual(expect.objectContaining({ automationEnabled: false }));
+      menu.label(target);
+      menu.onSelect(target);
+      await vi.waitFor(() => expect(harness.storage.get("workspaceOverrides")).toEqual({ w1: false }));
+      harness.documentReads.length = 0;
+      expect(await harness.beforeTurn("w1", "disabled-workspace")).toBeUndefined();
+      expect(harness.documentReads).toEqual([]);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it("restores an explicit workspace enable without enabling other workspaces", async () => {
+    const harness = activationHarness(false, "data", { overrides: { w: true, excluded: false } });
+    try {
+      await vi.waitFor(() => expect(harness.menu().visible?.({ workspaceId: "w", archived: false })).toBe(true));
+      expect((await harness.beforeTurn("w"))?.promptContributions).toEqual([expect.objectContaining({ visibility: "internal" })]);
+      expect(await harness.beforeTurn("excluded", "excluded-turn")).toBeUndefined();
+      expect(await harness.beforeTurn("unspecified", "unspecified-turn")).toBeUndefined();
+      expect(harness.documentReads).not.toContain("excluded.ccb");
+      expect(harness.documentReads).not.toContain("unspecified.ccb");
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it("changes inherited workspaces without retiring explicitly enabled turns", async () => {
+    const harness = activationHarness(true, "data", { overrides: { pinned: true } });
+    const current = harness.mountSettings();
+    try {
+      await vi.waitFor(() => expect(findSwitch(current())?.checked).toBe(true));
+      const inherited = await harness.beforeTurn("inherited", "inherited-turn");
+      const pinned = await harness.beforeTurn("pinned", "pinned-turn");
+      expect(inherited?.isCurrent?.()).toBe(true);
+      expect(pinned?.isCurrent?.()).toBe(true);
+      findSwitch(current())!.onChange({ currentTarget: { checked: false } });
+      await vi.waitFor(() => expect(findSwitch(current())?.checked).toBe(false));
+      expect(inherited?.isCurrent?.()).toBe(false);
+      expect(pinned?.isCurrent?.()).toBe(true);
+      expect(await harness.beforeTurn("inherited", "disabled-turn")).toBeUndefined();
+      findSwitch(current())!.onChange({ currentTarget: { checked: true } });
+      await vi.waitFor(() => expect(findSwitch(current())?.checked).toBe(true));
+      expect(inherited?.isCurrent?.()).toBe(false);
+      expect(pinned?.isCurrent?.()).toBe(true);
+      expect((await harness.beforeTurn("inherited", "fresh-turn"))?.isCurrent?.()).toBe(true);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it("discards inherited reads across a global toggle but retains explicit workspace reads", async () => {
+    const inheritedEntered = deferred();
+    const pinnedEntered = deferred();
+    const release = deferred();
+    const harness = activationHarness(true, "data", {
+      overrides: { pinned: true },
+      beforeRead: async (path) => {
+        if (path === "inherited.ccb") { inheritedEntered.resolve(); await release.promise; }
+        if (path === "pinned.ccb") { pinnedEntered.resolve(); await release.promise; }
+      },
+    });
+    const current = harness.mountSettings();
+    try {
+      await vi.waitFor(() => expect(findSwitch(current())?.checked).toBe(true));
+      const inherited = harness.beforeTurn("inherited", "inherited-turn");
+      const pinned = harness.beforeTurn("pinned", "pinned-turn");
+      await Promise.all([inheritedEntered.promise, pinnedEntered.promise]);
+      findSwitch(current())!.onChange({ currentTarget: { checked: false } });
+      await vi.waitFor(() => expect(findSwitch(current())?.checked).toBe(false));
+      findSwitch(current())!.onChange({ currentTarget: { checked: true } });
+      await vi.waitFor(() => expect(findSwitch(current())?.checked).toBe(true));
+      release.resolve();
+      expect(await inherited).toBeUndefined();
+      expect((await pinned)?.promptContributions).toEqual([expect.objectContaining({ visibility: "internal" })]);
+      expect(harness.documentReads).not.toContain("inherited.ccb.bak");
+    } finally {
+      release.resolve();
+      harness.cleanup();
+    }
   });
 
   it("keeps the workspace choice out of memory when it could not be persisted", async () => {
@@ -317,7 +410,7 @@ describe("plugin activation", () => {
     const entered = deferred();
     const release = deferred();
     let firstWrite = true;
-    const harness = activationHarness(true, "data", {
+    const harness = activationHarness(false, "data", {
       overrides: { w: false },
       beforeWrite: async () => {
         if (!firstWrite) return;
@@ -326,7 +419,7 @@ describe("plugin activation", () => {
         await release.promise;
       },
     });
-    await vi.waitFor(() => expect(harness.registered.session).toBe(1));
+    await vi.waitFor(() => expect(harness.menu().visible?.({ workspaceId: "w", archived: false })).toBe(true));
     harness.menu().onSelect({ workspaceId: "w", archived: false });
     await entered.promise;
     await harness.beforeTurn("w");

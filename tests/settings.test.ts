@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createEmptyEnvelope } from "../src/protocol/schema";
 import type { CoordinatorStatus } from "../src/coordinator/coordinator";
 import type { ReactLike } from "../src/sdk";
-import { createStatusComponent } from "../src/settings/component";
+import { createSettingsComponent, createStatusComponent } from "../src/settings/component";
 import { createSettingsModel, type SettingsDependencies } from "../src/settings/model";
 
 interface Doc { content: string; version: string }
@@ -84,10 +84,10 @@ function settingsHarness(options: HarnessOptions = {}): Harness {
   };
   const config = { automationEnabled: options.automation ?? false, ttlDays: 7 };
   let automationEnabled = config.automationEnabled;
-  let workspaceEnabled = options.workspaceEnabled ?? true;
+  let workspaceEnabled = options.workspaceEnabled;
   const dependencies: SettingsDependencies = {
     workspace: { getMetadata: async () => ({ id: "w", path: "C:/repo" }) },
-    workspaceEnabled: () => automationEnabled && workspaceEnabled,
+    workspaceEnabled: () => workspaceEnabled ?? automationEnabled,
     documents,
     coordinator: {
       pauseForMaintenance: async () => { log.push("pause"); },
@@ -115,20 +115,7 @@ function deferred() {
 }
 
 describe("settings model", () => {
-  it("saves automation and TTL while the host owns location selection", async () => {
-    const harness = settingsHarness();
-    const model = createSettingsModel(harness.dependencies);
-    await model.setAutomation(true);
-    await model.setLocation("custom");
-    await model.setTtlDays(null);
-    expect(harness.dependencies.setAutomation).toHaveBeenCalledWith(true);
-    expect(harness.log).toContain("select:custom");
-    expect(await harness.dependencies.documents.getLocation()).toEqual(expect.objectContaining({ kind: "custom" }));
-    expect(harness.dependencies.saveConfig).toHaveBeenLastCalledWith({ automationEnabled: true, ttlDays: null });
-    expect(harness.dependencies.saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ location: expect.anything() }));
-  });
-
-  it("derives location without reading documents while automation is off", async () => {
+  it("leaves unspecified workspaces unread when the global default is off", async () => {
     const harness = settingsHarness({ automation: false, root: "program" });
     const model = createSettingsModel(harness.dependencies);
     const snapshot = await model.load();
@@ -137,6 +124,30 @@ describe("settings model", () => {
     expect(snapshot.actualPath).toBeNull();
     expect(snapshot.currentJson).toBeNull();
     expect(harness.log).toEqual(["getLocation"]);
+  });
+
+  it("keeps global settings editable when current workspace metadata is unavailable", async () => {
+    const harness = settingsHarness();
+    harness.dependencies.workspace.getMetadata = async () => { throw new Error("no active workspace"); };
+    const model = createSettingsModel(harness.dependencies);
+    await expect(model.load()).resolves.toEqual(expect.objectContaining({
+      config: { automationEnabled: false, ttlDays: 7 },
+      currentJson: null,
+      actualPath: null,
+      workspaceError: "Error: no active workspace",
+    }));
+    await model.setAutomation(true);
+    expect((await model.load()).config.automationEnabled).toBe(true);
+    expect(harness.log).not.toContain("read:w.ccb");
+  });
+
+  it("reads an explicitly enabled workspace while the global default stays off", async () => {
+    const content = envelope("w", 2, "2026-09-13T10:00:00.000Z");
+    const harness = settingsHarness({ automation: false, workspaceEnabled: true, files: [["w.ccb", { content, version: "4" }]] });
+    const snapshot = await createSettingsModel(harness.dependencies).load();
+    expect(snapshot.config.automationEnabled).toBe(false);
+    expect(snapshot.actualPath).toBe("C:/data/plugin-data/ccb");
+    expect(snapshot.currentJson).toBe(content);
   });
 
   it("reaches document storage only from an explicit view action while off", async () => {
@@ -159,6 +170,7 @@ describe("settings model", () => {
     const harness = settingsHarness({ automation: true, workspaceEnabled: false, files: [["w.ccb", { content, version: "4" }]] });
     const model = createSettingsModel(harness.dependencies);
     const snapshot = await model.load();
+    expect(snapshot.config.automationEnabled).toBe(true);
     expect(snapshot.currentJson).toBeNull();
     expect(snapshot.actualPath).toBeNull();
     expect(harness.log).not.toContain("read:w.ccb");
@@ -169,10 +181,10 @@ describe("settings model", () => {
     expect(harness.roots.get("data")!.has("w.ccb")).toBe(false);
   });
 
-  it.each(["global", "workspace"])("rechecks %s disable after metadata has started", async (scope) => {
+  it.each(["global", "workspace", "disposal"])("rechecks %s disable after metadata has started", async (scope) => {
     const entered = deferred();
     const release = deferred();
-    const harness = settingsHarness({ automation: true });
+    const harness = settingsHarness({ automation: scope === "global", workspaceEnabled: scope === "global" ? undefined : true });
     harness.dependencies.workspace.getMetadata = async () => {
       entered.resolve();
       await release.promise;
@@ -182,13 +194,44 @@ describe("settings model", () => {
     const loading = model.load();
     await entered.promise;
     if (scope === "global") await model.setAutomation(false);
-    else harness.setWorkspaceEnabled(false);
+    else if (scope === "workspace") harness.setWorkspaceEnabled(false);
+    else harness.dependencies.workspaceEnabled = () => false;
     release.resolve();
     const snapshot = await loading;
     expect(snapshot.currentJson).toBeNull();
     expect(snapshot.actualPath).toBeNull();
     expect(harness.log).not.toContain("read:w.ccb");
-    expect(snapshot.config.automationEnabled).toBe(scope !== "global");
+    expect(snapshot.config.automationEnabled).toBe(false);
+  });
+
+  it.each(["global", "workspace", "disposal"])("discards a pending document read after %s disable", async (scope) => {
+    const entered = deferred();
+    const release = deferred();
+    const content = envelope("w", 2, "2026-09-13T10:00:00.000Z");
+    const harness = settingsHarness({
+      automation: scope === "global",
+      workspaceEnabled: scope === "global" ? undefined : true,
+      files: [["w.ccb", { content, version: "4" }]],
+    });
+    const read = harness.dependencies.documents.readText;
+    harness.dependencies.documents.readText = async (path) => {
+      const current = await read(path);
+      entered.resolve();
+      await release.promise;
+      return current;
+    };
+    const model = createSettingsModel(harness.dependencies);
+    const loading = model.load();
+    await entered.promise;
+    if (scope === "global") await model.setAutomation(false);
+    else if (scope === "workspace") harness.setWorkspaceEnabled(false);
+    else harness.dependencies.workspaceEnabled = () => false;
+    release.resolve();
+    const snapshot = await loading;
+    expect(snapshot.currentJson).toBeNull();
+    expect(snapshot.actualPath).toBeNull();
+    expect(snapshot.config.automationEnabled).toBe(false);
+    expect(harness.log.filter((entry) => entry.startsWith("read:"))).toEqual(["read:w.ccb"]);
   });
 
   it("does not commit a failed enable into later TTL saves or automatic reads", async () => {
@@ -351,13 +394,6 @@ describe("location switching", () => {
     expect(await harness.dependencies.documents.getLocation()).toEqual(expect.objectContaining({ kind: "data" }));
   });
 
-  it("uses the same host-only switching path while automation is off", async () => {
-    const harness = settingsHarness({ automation: false });
-    await createSettingsModel(harness.dependencies).setLocation("custom");
-    expect(harness.log).toEqual(["getLocation", "pause", "select:custom", "resume"]);
-    expect(harness.dependencies.saveConfig).not.toHaveBeenCalled();
-  });
-
   it("does not enter maintenance when the requested location is already active", async () => {
     const harness = settingsHarness({ root: "custom" });
     await createSettingsModel(harness.dependencies).setLocation("custom");
@@ -401,6 +437,31 @@ function fakeReact() {
     },
   };
 }
+
+describe("settings component", () => {
+  it("shows active workspace context without checking the global-default switch", async () => {
+    type Element = { type: unknown; props: Record<string, unknown> & { children: unknown[] } };
+    const findElement = (node: unknown, matches: (element: Element) => boolean): Element | undefined => {
+      if (!node || typeof node !== "object" || !("props" in node)) return undefined;
+      const element = node as Element;
+      if (matches(element)) return element;
+      for (const child of element.props.children) {
+        const found = findElement(child, matches);
+        if (found) return found;
+      }
+    };
+    const content = envelope("w", 2, "2026-09-13T10:00:00.000Z");
+    const harness = settingsHarness({ automation: false, workspaceEnabled: true, files: [["w.ccb", { content, version: "4" }]] });
+    const fake = fakeReact();
+    const current = fake.mount(createSettingsComponent({ react: fake.react, model: createSettingsModel(harness.dependencies), locale: "en-US" }));
+    await vi.waitFor(() => expect(findElement(current(), (element) => element.props.role === "switch")).toBeDefined());
+    expect(findElement(current(), (element) => element.props.role === "switch")!.props.checked).toBe(false);
+    expect(findElement(current(), (element) => element.type === "output")!.props.children).toEqual(["C:/data/plugin-data/ccb"]);
+    const disclosure = findElement(current(), (element) => element.type === "button" && element.props["aria-expanded"] === false)!;
+    (disclosure.props.onClick as () => void)();
+    expect(findElement(current(), (element) => element.type === "pre")!.props.children).toEqual([content]);
+  });
+});
 
 describe("status component", () => {
   it("re-renders when the coordinator status subscription changes", () => {

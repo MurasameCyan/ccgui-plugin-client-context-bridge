@@ -11,7 +11,7 @@ const STATUS_TOPIC = "plugin:ccgui.client-context-bridge:status";
 export default function activate(context: PluginContext): Disposer {
   const disposers: Disposer[] = [];
   let config = DEFAULT_CONFIG;
-  /** Per-workspace opt-out. No entry means the workspace follows the global switch. */
+  /** Explicit workspace choices override the global default in either direction. */
   let overrides: Record<string, boolean> = {};
   const zh = context.host.locale.toLowerCase().startsWith("zh");
   let status: CoordinatorStatus = "off";
@@ -19,12 +19,23 @@ export default function activate(context: PluginContext): Disposer {
   let settingsReady = false;
   let automationEnabled = false;
   const pendingWorkspaceDisables = new Map<string, number>();
-  const workspaceEnabled = (workspaceId: string) => !disposed && automationEnabled && overrides[workspaceId] !== false && !pendingWorkspaceDisables.has(workspaceId);
+  const workspaceSetting = (workspaceId: string) => overrides[workspaceId] ?? automationEnabled;
+  const workspaceEnabled = (workspaceId: string) => !disposed && workspaceSetting(workspaceId) && !pendingWorkspaceDisables.has(workspaceId);
   const coordinator = new ClientContextCoordinator(context, {
     ttlDays: () => config.ttlDays,
     workspaceEnabled,
     onStatus: (next) => { status = next; context.events.emit(STATUS_TOPIC, next); },
   });
+  const hasEnabledWorkspace = () => automationEnabled || Object.values(overrides).includes(true);
+  const refreshOperations = () => {
+    if (disposed) return;
+    if (hasEnabledWorkspace()) {
+      coordinator.enable();
+      coordinator.refreshWorkspaceEnablement();
+    } else {
+      coordinator.disable();
+    }
+  };
   /**
    * Both persisted keys, loaded once. Everything that reads or writes them
    * waits here: a settings render or a menu selection that raced the initial
@@ -37,15 +48,15 @@ export default function activate(context: PluginContext): Disposer {
       if (disposed) return;
       config = normalizeConfig(storedConfig);
       overrides = normalizeOverrides(storedOverrides);
-      if (config.automationEnabled) {
+      automationEnabled = config.automationEnabled;
+      if (hasEnabledWorkspace()) {
         try {
           await context.documentStorage.getLocation();
         } catch {
           status = "degraded";
         }
         if (disposed) return;
-        automationEnabled = true;
-        coordinator.enable();
+        refreshOperations();
       }
       settingsReady = true;
     });
@@ -58,8 +69,7 @@ export default function activate(context: PluginContext): Disposer {
   const setAutomation = (enabled: boolean) => {
     if (disposed) return;
     automationEnabled = enabled;
-    if (enabled) coordinator.enable();
-    else coordinator.disable();
+    refreshOperations();
   };
   /** Persist workspace choices serially without making uncommitted enables
    * effective. Disable intent gates immediately, even behind another write. */
@@ -72,7 +82,10 @@ export default function activate(context: PluginContext): Disposer {
       if (disposed) return;
       const nextOverrides = { ...overrides, [workspaceId]: enabled };
       await context.storage.set(WORKSPACE_OVERRIDES_KEY, nextOverrides);
-      if (!disposed) overrides = nextOverrides;
+      if (!disposed) {
+        overrides = nextOverrides;
+        refreshOperations();
+      }
     }).catch((error: unknown) => {
       if (!disposed) {
         status = "degraded";
@@ -141,23 +154,18 @@ export default function activate(context: PluginContext): Disposer {
   disposers.push(context.ui.registerWorkspaceMenuItem({
     key: "workspace-toggle",
     visible: () => settingsReady && !disposed,
-    // The host's context menu is a fixed narrow column and truncates labels,
-    // so this stays short: the workspace is already the right-click target,
-    // and only the global-off suffix carries extra state.
+    // The workspace is already the right-click target; show its effective action.
     label: ({ workspaceId }) => {
-      const on = overrides[workspaceId] !== false;
+      const on = workspaceSetting(workspaceId);
       renderedAction = { workspaceId, enabled: !on };
-      const action = zh ? (on ? "停用 CCB" : "启用 CCB") : on ? "Disable CCB" : "Enable CCB";
-      // Selecting the entry only records the per-workspace choice. The global
-      // switch lives in settings, so say plainly when nothing can run yet.
-      return config.automationEnabled ? action : `${action}${zh ? "（全局关闭）" : " (globally off)"}`;
+      return zh ? (on ? "停用 CCB" : "启用 CCB") : on ? "Disable CCB" : "Enable CCB";
     },
     onSelect: ({ workspaceId }) => {
       // Use the action the user saw, even if an earlier write finished while
       // this menu stayed open. Direct invocations use the current setting.
       const enabled = renderedAction?.workspaceId === workspaceId
         ? renderedAction.enabled
-        : overrides[workspaceId] === false;
+        : !workspaceSetting(workspaceId);
       renderedAction = undefined;
       void setWorkspaceEnabled(workspaceId, enabled).catch(() => {});
     },

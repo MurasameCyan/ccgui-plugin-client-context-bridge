@@ -16,7 +16,7 @@ export interface SettingsCoordinator {
 
 export interface SettingsDependencies {
   workspace: { getMetadata(): Promise<WorkspaceMetadata> };
-  /** Latest effective automation state, including global/workspace disable intent and disposal. */
+  /** Latest effective workspace state, including overrides, pending disable intent and disposal. */
   workspaceEnabled(workspaceId: string): boolean;
   documents: DocumentStorage;
   coordinator: SettingsCoordinator;
@@ -29,9 +29,11 @@ export interface SettingsDependencies {
 export interface SettingsSnapshot {
   config: BridgeConfig;
   location: DocumentStorageLocationKind;
-  /** Resolved root of the active storage location; null while automation is off. */
+  /** Resolved root of the active storage location; null while this workspace is disabled. */
   actualPath: string | null;
   currentJson: string | null;
+  /** Workspace preview failure; global controls remain usable. */
+  workspaceError?: string;
 }
 
 export interface SettingsModel {
@@ -99,14 +101,19 @@ export function createSettingsModel(dependencies: SettingsDependencies): Setting
   };
   return {
     async load() {
-      const [initialConfig, location] = await Promise.all([configPromise, dependencies.documents.getLocation()]);
-      if (!initialConfig.automationEnabled) return { config: initialConfig, location: location.kind, actualPath: null, currentJson: null };
-      const { id } = await dependencies.workspace.getMetadata();
+      const [location] = await Promise.all([dependencies.documents.getLocation(), configPromise]);
+      let workspace: WorkspaceMetadata;
+      try {
+        workspace = await dependencies.workspace.getMetadata();
+      } catch (error) {
+        return { config: await configPromise, location: location.kind, actualPath: null, currentJson: null, workspaceError: String(error) };
+      }
+      const { id } = workspace;
       let config = await configPromise;
-      if (!config.automationEnabled || !dependencies.workspaceEnabled(id)) return { config, location: location.kind, actualPath: null, currentJson: null };
+      if (!dependencies.workspaceEnabled(id)) return { config, location: location.kind, actualPath: null, currentJson: null };
       const current = await dependencies.documents.readText(`${id}.ccb`);
       config = await configPromise;
-      const enabled = config.automationEnabled && dependencies.workspaceEnabled(id);
+      const enabled = dependencies.workspaceEnabled(id);
       return { config, location: location.kind, actualPath: enabled ? location.path : null, currentJson: enabled ? current?.content ?? null : null };
     },
     async viewCurrent() {

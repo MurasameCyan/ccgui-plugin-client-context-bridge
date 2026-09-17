@@ -309,17 +309,18 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
     const off = !snapshot.config.automationEnabled;
     const ttl = snapshot.config.ttlDays === null ? "never" : String(snapshot.config.ttlDays);
     const path = snapshot.actualPath ?? text("开启后显示", "Shown when enabled");
+    const statusMessage = message || snapshot.workspaceError;
 
     return react.createElement("section", { className: "ccb-settings", style: SECTION },
-      // Group 1 — the master switch and what enabling it actually does.
+      // Group 1 — the global default and workspace overrides.
       react.createElement("div", { style: GROUP },
         react.createElement("div", { style: CARD },
           row("automation", true, true, [
             labelBlock(
               text("全局启用跨客户端上下文桥接", "Enable client context bridge globally"),
               off
-                ? text("已关闭：不会读取或写入 .ccb，查看、导出和清除仍由你手动触发。", "Off: no .ccb is read or written; view, export and clear stay manual.")
-                : text("切换客户端时自动接续当前任务上下文。", "Continues the current task context when you switch clients."),
+                ? text("全局默认关闭，单独启用的项目仍会运行。", "Off by default; individually enabled projects still run.")
+                : text("未单独设置的项目自动桥接，单独停用的项目保持关闭。", "Projects without an override bridge automatically; individually disabled projects stay off."),
             ),
             react.createElement("span", { style: switchTrack(!off, switchFocused) },
               react.createElement("span", { "aria-hidden": true, style: switchThumb(!off) }),
@@ -337,7 +338,7 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
           ]),
         ),
         react.createElement("p", { style: HINT }, text("开启后会加入不可见的任务状态维护指令；不共享完整聊天记录，也不会联网。", "When enabled, invisible task-state instructions are added. Full chat history is not shared and no network is used.")),
-        react.createElement("p", { style: HINT }, text("单个项目可在左侧工作区文件夹的右键菜单中单独开关；未单独设置的项目跟随全局。", "Use a workspace folder's context menu to enable or disable individual projects. Projects without an override follow the global setting.")),
+        react.createElement("p", { style: HINT }, text("安装后默认关闭。项目右键菜单可单独开关，项目选择优先于全局设置。", "Initially off. Use a workspace folder's context menu to override the global default for that project.")),
       ),
       // Group 2 — where the context files live and how long they survive.
       react.createElement("div", { style: GROUP },
@@ -408,7 +409,7 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
           react.createElement("button", { type: "button", style: BUTTON, onClick: () => run(() => model.clearCurrent()) }, text("清除当前工作区上下文", "Clear current workspace")),
           react.createElement("button", { type: "button", style: DANGER_BUTTON, onClick: () => run(() => model.clearAll()) }, text("清除全部上下文", "Clear all contexts")),
         ),
-        message ? react.createElement("p", { role: "status", style: STATUS_LINE }, message) : null,
+        statusMessage ? react.createElement("p", { role: "status", style: STATUS_LINE }, statusMessage) : null,
       ),
     );
   };
