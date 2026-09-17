@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import activate from "../src/activate";
-import type { PluginContext, ReactLike, TurnHooks } from "../src/sdk";
+import type { PluginContext, ReactLike, TurnHooks, WorkspaceMenuLabelValue } from "../src/sdk";
 
 interface HarnessOptions {
   overrides?: unknown;
@@ -28,9 +28,10 @@ function activationHarness(initialAutomation: boolean | null = null, initialLoca
   const emitted: unknown[] = [];
   const disposed: string[] = [];
   let settingsComponent: (() => unknown) | undefined;
+  let settingsLabel: (() => string) | undefined;
   let statusComponent: (() => unknown) | undefined;
   let workspaceMenu: {
-    label(context: { workspaceId: string; archived: boolean }): string;
+    label(context: { workspaceId: string; archived: boolean }): WorkspaceMenuLabelValue;
     visible?(context: { workspaceId: string; archived: boolean }): boolean;
     onSelect(context: { workspaceId: string; archived: boolean }): void;
   } | undefined;
@@ -44,6 +45,7 @@ function activationHarness(initialAutomation: boolean | null = null, initialLoca
       registerRuntimeSwitchHooks() { registered.runtimeSwitch += 1; return () => disposed.push("switch"); },
     },
     workspace: { getMetadata: async () => ({ id: "w", path: "C:/repo" }) },
+    workspaces: { list: async () => [{ id: "w", name: "Current project", path: "C:/repo" }] },
     documentStorage: {
       getLocation: async () => { calls.getLocation += 1; return { kind: "data" as const, path: "C:/data" }; },
       selectLocation: async (kind: "data" | "program" | "custom") => { calls.selectLocation += 1; return { kind, path: "C:/data" }; },
@@ -53,7 +55,7 @@ function activationHarness(initialAutomation: boolean | null = null, initialLoca
       list: async () => [],
     },
     ui: {
-      registerSettingsSection(definition: { component: () => unknown }) { registered.settings += 1; settingsComponent = definition.component; return () => disposed.push("settings"); },
+      registerSettingsSection(definition: { component: () => unknown; label?: () => string }) { registered.settings += 1; settingsComponent = definition.component; settingsLabel = definition.label; return () => disposed.push("settings"); },
       registerStatusBarItem(definition: { component: () => unknown }) { registered.status += 1; statusComponent = definition.component; return () => disposed.push("status"); },
       registerWorkspaceMenuItem(definition: typeof workspaceMenu & object) { registered.workspaceMenu += 1; workspaceMenu = definition; return () => disposed.push("workspace-menu"); },
     },
@@ -78,7 +80,7 @@ function activationHarness(initialAutomation: boolean | null = null, initialLoca
   } as unknown as PluginContext;
   const cleanup = activate(context);
   return {
-    storage, registered, disposed, settingsComponent, statusComponent, cleanup, calls, emitted, documentReads, writes,
+    storage, registered, disposed, settingsComponent, settingsLabel, statusComponent, cleanup, calls, emitted, documentReads, writes,
     menu: () => workspaceMenu!,
     mountSettings: () => renderer.mount(settingsComponent!),
     beforeTurn: (workspaceId: string, turnId = "turn") => turnHooks?.beforeTurn?.({
@@ -183,6 +185,15 @@ describe("plugin activation", () => {
     expect(harness.calls.selectLocation).toBe(0);
     expect(harness.calls.getLocation).toBe(0);
   });
+  it("uses the product name without the acronym in the settings title", () => {
+    const harness = activationHarness();
+    try {
+      expect(harness.settingsLabel?.()).toBe("Client Context Bridge");
+    } finally {
+      harness.cleanup();
+    }
+  });
+
 
   it("offers a per-workspace switch that persists the choice and reads back on the next launch", async () => {
     const harness = activationHarness(true);
@@ -202,6 +213,25 @@ describe("plugin activation", () => {
     harness.cleanup();
     relaunched.cleanup();
   });
+  it("labels the workspace action with a colored enabled or disabled status", async () => {
+    const harness = activationHarness(true);
+    try {
+      await vi.waitFor(() => expect(harness.menu().visible?.({ workspaceId: "w", archived: false })).toBe(true));
+      expect(harness.menu().label({ workspaceId: "w", archived: false })).toEqual({
+        text: "CCB",
+        status: { text: "Enabled", tone: "success" },
+      });
+      harness.menu().onSelect({ workspaceId: "w", archived: false });
+      await vi.waitFor(() => expect(harness.storage.get("workspaceOverrides")).toEqual({ w: false }));
+      expect(harness.menu().label({ workspaceId: "w", archived: false })).toEqual({
+        text: "CCB",
+        status: { text: "Disabled", tone: "muted" },
+      });
+    } finally {
+      harness.cleanup();
+    }
+  });
+
 
   it("enables only the selected workspace while the global default stays off", async () => {
     const harness = activationHarness(false);

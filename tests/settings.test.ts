@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createEmptyEnvelope } from "../src/protocol/schema";
 import type { CoordinatorStatus } from "../src/coordinator/coordinator";
-import type { ReactLike } from "../src/sdk";
+import type { ReactLike, RegisteredWorkspace } from "../src/sdk";
 import { createSettingsComponent, createStatusComponent } from "../src/settings/component";
 import { createSettingsModel, type SettingsDependencies } from "../src/settings/model";
 
@@ -16,6 +16,7 @@ interface HarnessOptions {
   workspaceEnabled?: boolean;
   root?: "data" | "program" | "custom";
   files?: Array<[string, Doc]>;
+  workspaces?: RegisteredWorkspace[];
 }
 
 interface Harness {
@@ -86,8 +87,11 @@ function settingsHarness(options: HarnessOptions = {}): Harness {
   let automationEnabled = config.automationEnabled;
   let workspaceEnabled = options.workspaceEnabled;
   const dependencies: SettingsDependencies = {
-    workspace: { getMetadata: async () => ({ id: "w", path: "C:/repo" }) },
-    workspaceEnabled: () => workspaceEnabled ?? automationEnabled,
+    workspace: {
+      getMetadata: async () => ({ id: "w", path: "C:/repo" }),
+      list: async () => options.workspaces ?? [{ id: "w", name: "Current project", path: "C:/repo" }],
+    },
+    workspaceEnabled: (workspaceId: string) => workspaceId === "w" ? (workspaceEnabled ?? automationEnabled) : automationEnabled,
     documents,
     coordinator: {
       pauseForMaintenance: async () => { log.push("pause"); },
@@ -158,6 +162,29 @@ describe("settings model", () => {
     await expect(model.viewCurrent()).resolves.toContain('"revision":2');
     expect(harness.log).toContain("read:w.ccb");
   });
+  it("lists stored context documents by registered project name without reading their contents", async () => {
+    const harness = settingsHarness({
+      workspaces: [
+        { id: "w", name: "Current project", path: "C:/repo" },
+        { id: "other", name: "Other project", path: "C:/other" },
+      ],
+      files: [
+        ["w.ccb", { content: envelope("w", 1, "2026-09-13T10:00:00.000Z"), version: "1" }],
+        ["other.ccb.bak", { content: envelope("other", 1, "2026-09-13T09:00:00.000Z"), version: "1" }],
+        ["orphan.ccb.conflict-2026-09-13", { content: envelope("orphan", 1, "2026-09-13T08:00:00.000Z"), version: "1" }],
+        ["notes.ccb.txt", { content: "keep", version: "1" }],
+      ],
+    });
+    const model = createSettingsModel(harness.dependencies);
+    await expect(model.listContexts()).resolves.toEqual([
+      { workspaceId: "w", projectName: "Current project" },
+      { workspaceId: "other", projectName: "Other project" },
+      { workspaceId: "orphan", projectName: "orphan" },
+    ]);
+    expect(harness.log).toContain("list");
+    expect(harness.log.filter((entry) => entry.startsWith("read:"))).toEqual([]);
+  });
+
 
   it("reads current JSON before exporting it as a real browser download", async () => {
     const harness = settingsHarness({ automation: true, files: [["w.ccb", { content: envelope("w", 1, "2026-09-13T10:00:00.000Z"), version: "1" }]] });
@@ -456,9 +483,10 @@ describe("settings component", () => {
     const current = fake.mount(createSettingsComponent({ react: fake.react, model: createSettingsModel(harness.dependencies), locale: "en-US" }));
     await vi.waitFor(() => expect(findElement(current(), (element) => element.props.role === "switch")).toBeDefined());
     expect(findElement(current(), (element) => element.props.role === "switch")!.props.checked).toBe(false);
-    expect(findElement(current(), (element) => element.type === "output")!.props.children).toEqual(["C:/data/plugin-data/ccb"]);
+    expect(findElement(current(), (element) => element.type === "output")).toBeUndefined();
     const disclosure = findElement(current(), (element) => element.type === "button" && element.props["aria-expanded"] === false)!;
     (disclosure.props.onClick as () => void)();
+    await vi.waitFor(() => expect(findElement(current(), (element) => element.type === "li")?.props.children).toEqual(["Current project"]));
     expect(findElement(current(), (element) => element.type === "pre")!.props.children).toEqual([content]);
   });
 });

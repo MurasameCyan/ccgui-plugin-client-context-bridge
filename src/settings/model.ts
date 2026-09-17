@@ -1,4 +1,4 @@
-import type { DocumentStorage, DocumentStorageLocationKind, WorkspaceMetadata } from "../sdk";
+import type { DocumentStorage, DocumentStorageLocationKind, RegisteredWorkspace, WorkspaceMetadata } from "../sdk";
 
 export interface BridgeConfig {
   automationEnabled: boolean;
@@ -15,7 +15,7 @@ export interface SettingsCoordinator {
 }
 
 export interface SettingsDependencies {
-  workspace: { getMetadata(): Promise<WorkspaceMetadata> };
+  workspace: { getMetadata(): Promise<WorkspaceMetadata>; list(): Promise<RegisteredWorkspace[]> };
   /** Latest effective workspace state, including overrides, pending disable intent and disposal. */
   workspaceEnabled(workspaceId: string): boolean;
   documents: DocumentStorage;
@@ -36,10 +36,17 @@ export interface SettingsSnapshot {
   workspaceError?: string;
 }
 
+export interface ContextDocumentSummary {
+  workspaceId: string;
+  projectName: string;
+}
+
 export interface SettingsModel {
   load(): Promise<SettingsSnapshot>;
   /** Explicit read of the current workspace document, allowed while automation is off. */
   viewCurrent(): Promise<string | null>;
+  /** Enumerates stored context artifacts without reading their document contents. */
+  listContexts(): Promise<ContextDocumentSummary[]>;
   setAutomation(enabled: boolean): Promise<void>;
   setLocation(kind: DocumentStorageLocationKind): Promise<void>;
   setTtlDays(days: number | null): Promise<void>;
@@ -47,9 +54,9 @@ export interface SettingsModel {
   clearCurrent(): Promise<void>;
   clearAll(): Promise<void>;
 }
-
 /** `<workspace>.ccb`, its single backup, or a conflict artifact — nothing else matches. */
 const CONTEXT_ARTIFACT = /^[^/\\]+\.ccb(?:\.bak|\.conflict-[^/\\]+)?$/;
+
 /** Mirrors the host's DocumentStorageConflictError across the bundle boundary (code, not instanceof). */
 function isConflict(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "DOCUMENT_STORAGE_CONFLICT";
@@ -119,6 +126,19 @@ export function createSettingsModel(dependencies: SettingsDependencies): Setting
     async viewCurrent() {
       const current = await dependencies.documents.readText(await currentPath());
       return current?.content ?? null;
+    },
+    async listContexts() {
+      const entries = await dependencies.documents.list();
+      const workspaceIds = new Set<string>();
+      for (const entry of entries) {
+        if (!CONTEXT_ARTIFACT.test(entry)) continue;
+        workspaceIds.add(entry.slice(0, entry.lastIndexOf(".ccb")));
+      }
+      if (workspaceIds.size === 0) return [];
+      const registered = new Map((await dependencies.workspace.list()).map((workspace) => [workspace.id, workspace.name]));
+      return [...workspaceIds]
+        .map((workspaceId) => ({ workspaceId, projectName: registered.get(workspaceId) ?? workspaceId }))
+        .sort((left, right) => left.projectName < right.projectName ? -1 : left.projectName > right.projectName ? 1 : left.workspaceId < right.workspaceId ? -1 : left.workspaceId > right.workspaceId ? 1 : 0);
     },
     async setAutomation(enabled) {
       const request = ++automationRequest;

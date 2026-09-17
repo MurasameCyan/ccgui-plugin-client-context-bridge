@@ -1,6 +1,6 @@
 import { ClientContextCoordinator, type CoordinatorStatus } from "./coordinator/coordinator";
-import type { Disposer, PluginContext } from "./sdk";
-import { DISPLAY_NAME, createSettingsComponent, createStatusComponent } from "./settings/component";
+import type { Disposer, PluginContext, WorkspaceMenuLabelValue } from "./sdk";
+import { DISPLAY_NAME, SETTINGS_DISPLAY_NAME, createSettingsComponent, createStatusComponent } from "./settings/component";
 import { browserDownload, createSettingsModel, type BridgeConfig } from "./settings/model";
 
 const DEFAULT_CONFIG: BridgeConfig = { automationEnabled: false, ttlDays: 7 };
@@ -103,7 +103,7 @@ export default function activate(context: PluginContext): Disposer {
     return next;
   };
   const model = createSettingsModel({
-    workspace: context.workspace,
+    workspace: { ...context.workspace, list: () => context.workspaces.list() },
     workspaceEnabled,
     documents: context.documentStorage,
     coordinator: {
@@ -137,7 +137,7 @@ export default function activate(context: PluginContext): Disposer {
   }));
   disposers.push(context.ui.registerSettingsSection({
     key: "settings",
-    label: () => DISPLAY_NAME,
+    label: () => SETTINGS_DISPLAY_NAME,
     component: createSettingsComponent({ react: context.react, model, locale: context.host.locale }),
   }));
   disposers.push(context.ui.registerStatusBarItem({
@@ -155,10 +155,16 @@ export default function activate(context: PluginContext): Disposer {
     key: "workspace-toggle",
     visible: () => settingsReady && !disposed,
     // The workspace is already the right-click target; show its effective action.
-    label: ({ workspaceId }) => {
-      const on = workspaceSetting(workspaceId);
-      renderedAction = { workspaceId, enabled: !on };
-      return zh ? (on ? "停用 CCB" : "启用 CCB") : on ? "Disable CCB" : "Enable CCB";
+    label: ({ workspaceId }): WorkspaceMenuLabelValue => {
+      const enabled = workspaceSetting(workspaceId);
+      renderedAction = { workspaceId, enabled: !enabled };
+      return {
+        text: "CCB",
+        status: {
+          text: zh ? (enabled ? "已启用" : "已禁用") : enabled ? "Enabled" : "Disabled",
+          tone: enabled ? "success" : "muted",
+        },
+      };
     },
     onSelect: ({ workspaceId }) => {
       // Use the action the user saw, even if an earlier write finished while

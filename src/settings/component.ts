@@ -1,10 +1,11 @@
 import type { Disposer, ReactLike } from "../sdk";
 import type { CoordinatorStatus } from "../coordinator/coordinator";
-import type { SettingsModel, SettingsSnapshot } from "./model";
+import type { ContextDocumentSummary, SettingsModel, SettingsSnapshot } from "./model";
 
-/** Plugin display name, identical in every locale (the host renders the
- *  trailing acronym one step smaller). Keep in sync with manifest.json. */
+/** Plugin display name used by status surfaces and metadata. */
 export const DISPLAY_NAME = "Client Context Bridge (CCB)";
+/** Settings navigation title omits the parenthetical acronym. */
+export const SETTINGS_DISPLAY_NAME = "Client Context Bridge";
 
 const STATUS_LABELS: Record<CoordinatorStatus, { zh: string; en: string }> = {
   synced: { zh: "已同步", en: "Synced" },
@@ -105,23 +106,6 @@ const CONTROL: Record<string, unknown> = {
   fontSize: BODY,
   fontFamily: "inherit",
   cursor: "pointer",
-};
-const READONLY_FIELD: Record<string, unknown> = {
-  boxSizing: "border-box",
-  display: "block",
-  minWidth: 0,
-  flex: "0 1 320px",
-  lineHeight: "32px",
-  height: "32px",
-  maxWidth: "100%",
-  padding: "0 10px",
-  borderRadius: "10px",
-  background: FIELD_BG,
-  color: TEXT_SECONDARY,
-  fontSize: BODY_2,
-  whiteSpace: "nowrap",
-  overflow: "hidden",
-  textOverflow: "ellipsis",
 };
 const BUTTON: Record<string, unknown> = {
   boxSizing: "border-box",
@@ -291,6 +275,7 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
     const [message, setMessage] = react.useState("");
     const [preview, setPreview] = react.useState<string | null>(null);
     const [previewOpen, setPreviewOpen] = react.useState(false);
+    const [contexts, setContexts] = react.useState<ContextDocumentSummary[] | null>(null);
     const [switchFocused, setSwitchFocused] = react.useState(false);
     react.useEffect(() => {
       let active = true;
@@ -308,8 +293,15 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
     };
     const off = !snapshot.config.automationEnabled;
     const ttl = snapshot.config.ttlDays === null ? "never" : String(snapshot.config.ttlDays);
-    const path = snapshot.actualPath ?? text("开启后显示", "Shown when enabled");
     const statusMessage = message || snapshot.workspaceError;
+    const togglePreview = () => {
+      const nextOpen = !previewOpen;
+      setPreviewOpen(nextOpen);
+      if (!nextOpen) return;
+      setContexts(null);
+      setMessage("");
+      void model.listContexts().then(setContexts).catch((error: unknown) => setMessage(String(error)));
+    };
 
     return react.createElement("section", { className: "ccb-settings", style: SECTION },
       // Group 1 — the global default and workspace overrides.
@@ -355,10 +347,6 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
             react.createElement("option", { value: "program" }, text("程序目录", "Program directory")),
             react.createElement("option", { value: "custom" }, text("自定义目录", "Custom directory"))),
           ]),
-          row("path", false, false, [
-            labelBlock(text("实际路径", "Resolved path")),
-            react.createElement("output", { style: READONLY_FIELD, title: path }, path),
-          ]),
           row("ttl", true, true, [
             labelBlock(text("上下文有效期", "Context TTL")),
             react.createElement("select", {
@@ -383,7 +371,7 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
             style: DISCLOSURE_ROW,
             "aria-expanded": previewOpen,
             "aria-controls": "ccb-current-preview",
-            onClick: () => setPreviewOpen((open) => !open),
+            onClick: togglePreview,
           },
             react.createElement("span", { "aria-hidden": true, style: caret(previewOpen) }),
             text("查看当前上下文", "View current context"),
@@ -399,7 +387,17 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
                 type: "button",
                 style: BUTTON,
                 onClick: () => { setMessage(""); void model.viewCurrent().then(setPreview).catch((error: unknown) => setMessage(String(error))); },
-              }, text("读取", "Load")),
+              }, text("读取当前工作区", "Load current workspace")),
+            ),
+            react.createElement("div", null,
+              react.createElement("p", { style: ROW_LABEL }, text("已存储项目", "Stored projects")),
+              contexts === null
+                ? react.createElement("p", { style: HINT, "aria-live": "polite" }, text("正在加载…", "Loading…"))
+                : contexts.length === 0
+                  ? react.createElement("p", { style: HINT }, text("暂无已存储项目", "No stored projects"))
+                  : react.createElement("ul", { "aria-label": text("已存储项目", "Stored projects"), style: { margin: 0, paddingLeft: "20px", color: TEXT_PRIMARY } },
+                    ...contexts.map((context) => react.createElement("li", { key: context.workspaceId, style: ROW_LABEL }, context.projectName)),
+                  ),
             ),
             react.createElement("pre", { style: PREVIEW }, preview ?? snapshot.currentJson ?? text("暂无上下文", "No context")),
           ) : null,

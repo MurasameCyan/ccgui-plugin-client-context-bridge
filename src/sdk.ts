@@ -4,6 +4,13 @@
  */
 export type Disposer = () => void;
 export type DocumentStorageLocationKind = "data" | "program" | "custom";
+export type WorkspaceMenuStatusTone = "success" | "muted";
+export interface WorkspaceMenuLabel {
+  text: string;
+  status?: { text: string; tone: WorkspaceMenuStatusTone };
+}
+export type WorkspaceMenuLabelValue = string | WorkspaceMenuLabel;
+
 
 export interface WorkspaceMetadata {
   id: string;
@@ -11,6 +18,11 @@ export interface WorkspaceMetadata {
   gitBranch?: string;
   gitHead?: string;
   dirty?: boolean;
+}
+export interface RegisteredWorkspace {
+  id: string;
+  name: string;
+  path: string;
 }
 export interface PromptContribution {
   id: string;
@@ -122,6 +134,7 @@ export interface PluginContext {
     registerRuntimeSwitchHooks(hooks: RuntimeSwitchHooks): Disposer;
   };
   workspace: { getMetadata(): Promise<WorkspaceMetadata> };
+  workspaces: { list(): Promise<RegisteredWorkspace[]> };
   documentStorage: DocumentStorage;
   ui: {
     registerSettingsSection(definition: { key?: string; label: () => string; icon?: ComponentLike<{ className?: string }>; component: ComponentLike }): Disposer;
@@ -129,7 +142,7 @@ export interface PluginContext {
     /** Sidebar workspace row context-menu entry (generic host extension point). */
     registerWorkspaceMenuItem(definition: {
       key?: string;
-      label: (context: { workspaceId: string; archived: boolean }) => string;
+      label: (context: { workspaceId: string; archived: boolean }) => WorkspaceMenuLabelValue;
       icon?: ComponentLike<{ className?: string }>;
       visible?: (context: { workspaceId: string; archived: boolean }) => boolean;
       onSelect: (context: { workspaceId: string; archived: boolean }) => void;
