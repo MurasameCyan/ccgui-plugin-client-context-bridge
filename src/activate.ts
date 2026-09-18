@@ -1,6 +1,6 @@
 import { ClientContextCoordinator, type CoordinatorStatus } from "./coordinator/coordinator";
 import type { Disposer, PluginContext, WorkspaceMenuLabelValue } from "./sdk";
-import { DISPLAY_NAME, SETTINGS_DISPLAY_NAME, createSettingsComponent, createStatusComponent } from "./settings/component";
+import { DISPLAY_NAME, SETTINGS_DISPLAY_NAME, createSettingsComponent } from "./settings/component";
 import { browserDownload, createSettingsModel, type BridgeConfig } from "./settings/model";
 
 const DEFAULT_CONFIG: BridgeConfig = { automationEnabled: false, ttlDays: 7 };
@@ -139,16 +139,6 @@ export default function activate(context: PluginContext): Disposer {
     key: "settings",
     label: () => SETTINGS_DISPLAY_NAME,
     component: createSettingsComponent({ react: context.react, model, locale: context.host.locale }),
-  }));
-  disposers.push(context.ui.registerStatusBarItem({
-    key: "status",
-    component: createStatusComponent(
-      context.react,
-      context.host.locale,
-      () => status,
-      (listener) => context.events.on(STATUS_TOPIC, (data) => listener(data as CoordinatorStatus)),
-    ),
-    order: 100,
   }));
   let renderedAction: { workspaceId: string; enabled: boolean } | undefined;
   disposers.push(context.ui.registerWorkspaceMenuItem({

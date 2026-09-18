@@ -150,6 +150,7 @@ describe("plugin activation", () => {
     const current = harness.mountSettings();
     try {
       await vi.waitFor(() => expect(findSwitch(current())?.checked).toBe(false));
+      expect(harness.registered.status).toBe(0);
       expect(await harness.beforeTurn("w")).toBeUndefined();
       expect(harness.documentReads).toEqual([]);
       expect(harness.writes).toEqual([]);

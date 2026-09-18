@@ -9,7 +9,6 @@
   "permissions": [
     "storage",
     "ui:settings-section",
-    "ui:status-bar",
     "ui:workspace-menu",
     "i18n",
     "events",
