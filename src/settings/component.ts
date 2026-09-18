@@ -1,5 +1,4 @@
-import type { Disposer, ReactLike } from "../sdk";
-import type { CoordinatorStatus } from "../coordinator/coordinator";
+import type { ReactLike } from "../sdk";
 import type { ContextDocumentSummary, SettingsModel, SettingsSnapshot } from "./model";
 
 /** Plugin display name used by status surfaces and metadata. */
@@ -7,14 +6,6 @@ export const DISPLAY_NAME = "Client Context Bridge (CCB)";
 /** Settings navigation title omits the parenthetical acronym. */
 export const SETTINGS_DISPLAY_NAME = "Client Context Bridge";
 
-const STATUS_LABELS: Record<CoordinatorStatus, { zh: string; en: string }> = {
-  synced: { zh: "已同步", en: "Synced" },
-  pending: { zh: "等待同步", en: "Pending sync" },
-  degraded: { zh: "已降级", en: "Degraded" },
-  "write-failed": { zh: "写入失败", en: "Write failed" },
-  continued: { zh: "已从其他客户端接续", en: "Continued from another client" },
-  off: { zh: "已关闭", en: "Off" },
-};
 
 /**
  * The host applies no styling to plugin subtrees and this plugin holds no
@@ -413,16 +404,3 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
   };
 }
 
-export function createStatusComponent(
-  react: ReactLike,
-  locale: string,
-  getStatus: () => CoordinatorStatus,
-  subscribe: (listener: (status: CoordinatorStatus) => void) => Disposer,
-) {
-  const zh = locale.toLowerCase().startsWith("zh");
-  return function ClientContextBridgeStatus() {
-    const [status, setStatus] = react.useState<CoordinatorStatus>(getStatus);
-    react.useEffect(() => subscribe(setStatus), []);
-    return react.createElement("span", { title: DISPLAY_NAME, "data-status": status }, STATUS_LABELS[status][zh ? "zh" : "en"]);
-  };
-}

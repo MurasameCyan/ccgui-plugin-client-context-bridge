@@ -1,8 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createEmptyEnvelope } from "../src/protocol/schema";
-import type { CoordinatorStatus } from "../src/coordinator/coordinator";
 import type { ReactLike, RegisteredWorkspace } from "../src/sdk";
-import { createSettingsComponent, createStatusComponent } from "../src/settings/component";
+import { createSettingsComponent } from "../src/settings/component";
 import { createSettingsModel, type SettingsDependencies } from "../src/settings/model";
 
 interface Doc { content: string; version: string }
@@ -491,21 +490,4 @@ describe("settings component", () => {
   });
 });
 
-describe("status component", () => {
-  it("re-renders when the coordinator status subscription changes", () => {
-    const listeners = new Set<(status: CoordinatorStatus) => void>();
-    let status: CoordinatorStatus = "off";
-    const subscribe = (listener: (status: CoordinatorStatus) => void) => {
-      listeners.add(listener);
-      return () => { listeners.delete(listener); };
-    };
-    const fake = fakeReact();
-    const Component = createStatusComponent(fake.react, "en-US", () => status, subscribe);
-    const current = fake.mount(Component);
-    expect(current().props["data-status"]).toBe("off");
-    status = "synced";
-    for (const listener of [...listeners]) listener(status);
-    expect(current().props["data-status"]).toBe("synced");
-  });
-});
 
