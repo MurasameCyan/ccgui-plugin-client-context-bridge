@@ -1,4 +1,4 @@
-import { MAX_PATCH_BYTES, parseSemanticPatch, type SemanticPatch } from "./schema";
+import { MAX_PATCH_BYTES, PATCH_KEYS, parseSemanticPatch, type SemanticPatch } from "./schema";
 
 const PLUGIN_ID = "ccgui.client-context-bridge";
 
@@ -42,7 +42,8 @@ export class IncrementalFrameParser {
       if (new TextEncoder().encode(rawPayload).byteLength <= MAX_PATCH_BYTES) {
         try {
           const parsed = JSON.parse(rawPayload) as unknown;
-          if (isFrameEnvelope(parsed)) complete.push({ start, end, patch: parseSemanticPatch(parsed.patch) });
+          const normalized = normalizedFramePatch(parsed);
+          if (normalized) complete.push({ start, end, patch: parseSemanticPatch(normalized.patch) });
         } catch {
           // Invalid frames remain user-visible by design.
         }
@@ -64,14 +65,31 @@ export class IncrementalFrameParser {
   }
 }
 
-function isFrameEnvelope(value: unknown): value is { plugin: string; version: number; patch: unknown } {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+/**
+ * A CCB frame's patch, with misplaced patch keys lifted into `patch`.
+ *
+ * Model output is untrusted but imperfect: a real OMP turn emitted `append`
+ * as a sibling of `patch` rather than inside it, so the whole frame was
+ * discarded and the turn reduced as `semantic-update-missing` despite an
+ * unambiguous intent. Recover that shape, but keep two guarantees: `patch`
+ * stays authoritative (a stray sibling never overwrites a key it already
+ * carries), and a frame bearing any genuinely unknown key is still refused
+ * so it remains user-visible.
+ */
+export function normalizedFramePatch(value: unknown): { patch: unknown } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const frame = value as Record<string, unknown>;
-  const keys = Object.keys(frame);
-  return keys.length === 3
-    && keys.every((key) => key === "plugin" || key === "version" || key === "patch")
-    && frame.plugin === PLUGIN_ID
-    && frame.version === 1;
+  if (frame.plugin !== PLUGIN_ID || frame.version !== 1 || !("patch" in frame)) return null;
+  let patch = frame.patch;
+  for (const key of Object.keys(frame)) {
+    if (key === "plugin" || key === "version" || key === "patch") continue;
+    if (!(PATCH_KEYS as readonly string[]).includes(key)) return null;
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) return null;
+    const inner = patch as Record<string, unknown>;
+    if (key in inner) continue;
+    patch = { ...inner, [key]: frame[key] };
+  }
+  return { patch };
 }
 
 /**
@@ -80,9 +98,10 @@ function isFrameEnvelope(value: unknown): value is { plugin: string; version: nu
  * hidden. Accepts only a well-formed CCB frame carrying a valid semantic patch.
  */
 export function isCompleteInternalFrame(payload: unknown): boolean {
-  if (!isFrameEnvelope(payload)) return false;
+  const normalized = normalizedFramePatch(payload);
+  if (!normalized) return false;
   try {
-    parseSemanticPatch(payload.patch);
+    parseSemanticPatch(normalized.patch);
     return true;
   } catch {
     return false;

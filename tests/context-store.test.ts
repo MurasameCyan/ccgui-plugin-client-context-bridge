@@ -233,7 +233,9 @@ describe("context store", () => {
     { stage: "conflict reload", existing: "valid", version: "stale", blocked: "read:w.ccb", calls: ["write:w.ccb:1", "read:w.ccb"] },
     { stage: "backup conflict reload", existing: "corrupt", version: "stale", blocked: "read:w.ccb.bak", calls: ["write:w.ccb:1", "read:w.ccb", "read:w.ccb.bak"] },
     { stage: "missing-document reload", existing: "missing", version: "stale", blocked: "read:w.ccb.bak", calls: ["write:w.ccb:1", "read:w.ccb", "read:w.ccb.bak"] },
-    { stage: "recreated document write", existing: "missing", version: "stale", blocked: "write:w.ccb:2", calls: ["write:w.ccb:1", "read:w.ccb", "read:w.ccb.bak", "write:w.ccb:2"] },
+    // The recreate path now probes presence first (a null `load` can also mean
+    // "present but unreadable"), so its read of the main document repeats.
+    { stage: "recreated document write", existing: "missing", version: "stale", blocked: "write:w.ccb:2", calls: ["write:w.ccb:1", "read:w.ccb", "read:w.ccb.bak", "read:w.ccb", "write:w.ccb:2"] },
     { stage: "conflict artifact write", existing: "valid", version: "stale", blocked: "write:artifact", calls: ["write:w.ccb:1", "read:w.ccb", "write:artifact"] },
     { stage: "merged document write", existing: "valid", version: "stale", blocked: "write:w.ccb:2", calls: ["write:w.ccb:1", "read:w.ccb", "write:artifact", "write:w.ccb:2"] },
   ])("cancels a save during $stage without follow-up I/O or saved status", async ({ existing, version, blocked, calls: expectedCalls }) => {

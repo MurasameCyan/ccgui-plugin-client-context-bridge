@@ -152,7 +152,7 @@ export function contentFingerprint(envelope: CcbEnvelopeV1): string {
 
 const ENVELOPE_KEYS = ["format", "schemaVersion", "workspaceId", "revision", "updatedAt", "source", "workspace", "task", "changes", "verification", "provenance", "consumption"] as const;
 const TASK_KEYS = ["goal", "acceptance", "constraints", "completed", "remaining", "decisions", "risks", "nextAction"] as const;
-const PATCH_KEYS = ["set", "append", "remove"] as const;
+export const PATCH_KEYS = ["set", "append", "remove"] as const;
 const SET_KEYS = ["goal", "nextAction"] as const;
 const APPEND_KEYS = ["acceptance", "constraints", "completed", "remaining", "decisions", "risks"] as const;
 const REMOVE_KEYS = ["acceptanceIds", "constraintIds", "completedIds", "remainingIds", "decisionIds", "riskIds"] as const;

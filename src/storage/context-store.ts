@@ -74,8 +74,14 @@ export class ContextStore {
         const latest = await this.load(context.envelope.workspaceId, isCurrent);
         if (!isCurrent()) return null;
         if (!latest) {
-          // The document was removed under us (clear, another window, purge). A
-          // stale in-memory version must not pin the workspace into write-failed.
+          // `load` also returns null for a document that IS present but
+          // unreadable: corrupt main plus corrupt backup, or an envelope
+          // belonging to another workspace. Recreating those with
+          // expectedVersion null would discard content another host process
+          // committed, so probe presence and only recreate what is truly gone.
+          const present = await this.storage.readText(path);
+          if (!isCurrent()) return null;
+          if (present) throw error;
           const written = await this.storage.writeTextAtomic(path, serialized, null);
           if (!isCurrent()) return null;
           return { envelope: context.envelope, version: written.version, baseEnvelope: structuredClone(context.envelope), status: "saved" };

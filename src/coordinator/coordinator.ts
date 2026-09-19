@@ -1,5 +1,5 @@
 import { MAX_PATCH_BYTES, createEmptyEnvelope, parseSemanticPatch, type SemanticPatch } from "../protocol/schema";
-import { isCompleteInternalFrame } from "../protocol/frame-parser";
+import { isCompleteInternalFrame, normalizedFramePatch } from "../protocol/frame-parser";
 import { PROTOCOL_RESERVE_BYTES, compileHandoff, contributionBytes } from "../prompt/compiler";
 import { reduceContext, type HostFacts } from "../state/reducer";
 import { ContextStore, type StoredContext } from "../storage/context-store";
@@ -411,11 +411,12 @@ export class ClientContextCoordinator {
     });
   }
 
+  /** Frames arrive from an untrusted model: a patch key misplaced as a
+   * sibling of `patch` is lifted in, so one formatting slip does not reduce
+   * the turn as `semantic-update-missing`. Unknown keys still reject. */
   private extractPatch(payload: unknown): SemanticPatch {
-    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-      const frame = payload as Record<string, unknown>;
-      if (frame.plugin === "ccgui.client-context-bridge" && frame.version === 1 && "patch" in frame) return parseSemanticPatch(frame.patch);
-    }
+    const normalized = normalizedFramePatch(payload);
+    if (normalized) return parseSemanticPatch(normalized.patch);
     return parseSemanticPatch(payload);
   }
 
