@@ -7,6 +7,7 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "check:sdk": "node scripts/check-sdk-mirror.mjs",
     "build": "tsc --noEmit && vite build"
   },
   "devDependencies": {
