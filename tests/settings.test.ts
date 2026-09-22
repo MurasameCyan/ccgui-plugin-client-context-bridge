@@ -184,6 +184,47 @@ describe("settings model", () => {
     expect(harness.log.filter((entry) => entry.startsWith("read:"))).toEqual([]);
   });
 
+  it("reads and edits one project's context with its storage version", async () => {
+    const original = envelope("w", 2, "2026-09-13T10:00:00.000Z");
+    const harness = settingsHarness({
+      files: [["w.ccb", { content: original, version: "4" }]],
+    });
+    const model = createSettingsModel(harness.dependencies);
+    await expect(model.readContext("w")).resolves.toEqual({
+      workspaceId: "w",
+      projectName: "Current project",
+      content: original,
+      version: "4",
+    });
+    const edited = envelope("w", 3, "2026-09-13T11:00:00.000Z");
+    await model.saveContext("w", edited, "4");
+    expect(harness.roots.get("data")!.get("w.ccb")).toEqual({ content: edited, version: "5" });
+  });
+
+  it("validates edited JSON and keeps a stale project edit from overwriting newer content", async () => {
+    const original = envelope("w", 2, "2026-09-13T10:00:00.000Z");
+    const harness = settingsHarness({ files: [["w.ccb", { content: original, version: "4" }]] });
+    const model = createSettingsModel(harness.dependencies);
+    await expect(model.saveContext("w", "{not json", "4")).rejects.toThrow("not valid JSON");
+    await expect(model.saveContext("w", envelope("other", 3, "2026-09-13T11:00:00.000Z"), "4")).rejects.toThrow("workspaceId");
+    harness.roots.get("data")!.set("w.ccb", { content: envelope("w", 4, "2026-09-13T12:00:00.000Z"), version: "5" });
+    await expect(model.saveContext("w", envelope("w", 3, "2026-09-13T11:00:00.000Z"), "4")).rejects.toThrow("version conflict");
+    expect(harness.roots.get("data")!.get("w.ccb")?.version).toBe("5");
+  });
+
+  it("deletes only one project's context artifacts", async () => {
+    const harness = settingsHarness({
+      files: [
+        ["w.ccb", { content: envelope("w", 1, "2026-09-13T10:00:00.000Z"), version: "1" }],
+        ["w.ccb.bak", { content: envelope("w", 1, "2026-09-13T09:00:00.000Z"), version: "2" }],
+        ["other.ccb", { content: envelope("other", 1, "2026-09-13T09:00:00.000Z"), version: "3" }],
+      ],
+    });
+    await createSettingsModel(harness.dependencies).clearContext("w");
+    expect(harness.removed.map((entry) => entry.path)).toEqual(["w.ccb", "w.ccb.bak"]);
+    expect(harness.roots.get("data")!.has("other.ccb")).toBe(true);
+  });
+
 
   it("reads current JSON before exporting it as a real browser download", async () => {
     const harness = settingsHarness({ automation: true, files: [["w.ccb", { content: envelope("w", 1, "2026-09-13T10:00:00.000Z"), version: "1" }]] });
@@ -485,9 +526,46 @@ describe("settings component", () => {
     expect(findElement(current(), (element) => element.type === "output")).toBeUndefined();
     const disclosure = findElement(current(), (element) => element.type === "button" && element.props["aria-expanded"] === false)!;
     (disclosure.props.onClick as () => void)();
-    await vi.waitFor(() => expect(findElement(current(), (element) => element.type === "li")?.props.children).toEqual(["Current project"]));
+    await vi.waitFor(() => expect(findElement(current(), (element) => element.props["data-context-row"] === true)).toBeDefined());
     expect(findElement(current(), (element) => element.type === "pre")!.props.children).toEqual([content]);
   });
 });
+
+  it("renders one colored row per stored project with view, edit, and delete actions", async () => {
+    type Element = { type: unknown; props: Record<string, unknown> & { children: unknown[] } };
+    const findAll = (node: unknown, matches: (element: Element) => boolean, result: Element[] = []): Element[] => {
+      if (Array.isArray(node)) {
+        for (const child of node) findAll(child, matches, result);
+        return result;
+      }
+      if (!node || typeof node !== "object" || !("props" in node)) return result;
+      const element = node as Element;
+      if (matches(element)) result.push(element);
+      for (const child of element.props.children) findAll(child, matches, result);
+      return result;
+    };
+    const harness = settingsHarness({
+      files: [
+        ["w.ccb", { content: envelope("w", 1, "2026-09-13T10:00:00.000Z"), version: "1" }],
+        ["other.ccb", { content: envelope("other", 1, "2026-09-13T09:00:00.000Z"), version: "2" }],
+      ],
+      workspaces: [
+        { id: "w", name: "Current project", path: "C:/repo" },
+        { id: "other", name: "Other project", path: "C:/other" },
+      ],
+    });
+    const fake = fakeReact();
+    const current = fake.mount(createSettingsComponent({ react: fake.react, model: createSettingsModel(harness.dependencies), locale: "en-US" }));
+    await vi.waitFor(() => expect(findAll(current(), (element) => element.props.role === "switch")).toHaveLength(1));
+    expect(findAll(current(), (element) => element.props["data-context-row"] === true)).toHaveLength(0);
+    const disclosure = findAll(current(), (element) => element.type === "button" && element.props["aria-expanded"] === false)[0];
+    (disclosure.props.onClick as () => void)();
+    await vi.waitFor(() => expect(findAll(current(), (element) => element.props["data-context-row"] === true)).toHaveLength(2));
+    const rows = findAll(current(), (element) => element.props["data-context-row"] === true);
+    expect(rows.every((row) => String((row.props.style as Record<string, unknown>).borderLeft).includes("solid"))).toBe(true);
+    expect(findAll(rows[0], (element) => element.props["data-context-action"] === "view")).toHaveLength(1);
+    expect(findAll(rows[0], (element) => element.props["data-context-action"] === "edit")).toHaveLength(1);
+    expect(findAll(rows[0], (element) => element.props["data-context-action"] === "delete")).toHaveLength(1);
+  });
 
 

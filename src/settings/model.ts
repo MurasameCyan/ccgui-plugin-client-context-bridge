@@ -1,3 +1,4 @@
+import { parseCcbEnvelope } from "../protocol/schema";
 import type { DocumentStorage, DocumentStorageLocationKind, RegisteredWorkspace, WorkspaceMetadata } from "../sdk";
 
 export interface BridgeConfig {
@@ -41,12 +42,23 @@ export interface ContextDocumentSummary {
   projectName: string;
 }
 
+export interface ContextDocument {
+  workspaceId: string;
+  projectName: string;
+  content: string;
+  /** Version of the primary `.ccb`; null means the primary was absent and a backup was shown. */
+  version: string | null;
+}
+
 export interface SettingsModel {
   load(): Promise<SettingsSnapshot>;
   /** Explicit read of the current workspace document, allowed while automation is off. */
   viewCurrent(): Promise<string | null>;
   /** Enumerates stored context artifacts without reading their document contents. */
   listContexts(): Promise<ContextDocumentSummary[]>;
+  readContext(workspaceId: string): Promise<ContextDocument | null>;
+  saveContext(workspaceId: string, content: string, expectedVersion: string | null): Promise<void>;
+  clearContext(workspaceId: string): Promise<void>;
   setAutomation(enabled: boolean): Promise<void>;
   setLocation(kind: DocumentStorageLocationKind): Promise<void>;
   setTtlDays(days: number | null): Promise<void>;
@@ -82,7 +94,20 @@ export function createSettingsModel(dependencies: SettingsDependencies): Setting
     configWrites = next.catch(() => {});
     return next;
   };
-  const currentPath = async () => `${(await dependencies.workspace.getMetadata()).id}.ccb`;
+  const currentWorkspaceId = async () => (await dependencies.workspace.getMetadata()).id;
+  const currentPath = async () => `${await currentWorkspaceId()}.ccb`;
+  const projectName = async (workspaceId: string) => {
+    const registered = await dependencies.workspace.list();
+    return registered.find((workspace) => workspace.id === workspaceId)?.name ?? workspaceId;
+  };
+  const belongsToWorkspace = (entry: string, workspaceId: string) => {
+    const path = `${workspaceId}.ccb`;
+    return entry === path || entry.startsWith(`${path}.`);
+  };
+  const validateContext = (workspaceId: string, content: string) => {
+    const envelope = parseCcbEnvelope(content);
+    if (envelope.workspaceId !== workspaceId) throw new Error("workspaceId does not match the selected project");
+  };
 
   /**
    * Reads each entry's version and removes it with CAS. A conflicting write keeps
@@ -140,6 +165,22 @@ export function createSettingsModel(dependencies: SettingsDependencies): Setting
         .map((workspaceId) => ({ workspaceId, projectName: registered.get(workspaceId) ?? workspaceId }))
         .sort((left, right) => left.projectName < right.projectName ? -1 : left.projectName > right.projectName ? 1 : left.workspaceId < right.workspaceId ? -1 : left.workspaceId > right.workspaceId ? 1 : 0);
     },
+    async readContext(workspaceId) {
+      const path = `${workspaceId}.ccb`;
+      const current = await dependencies.documents.readText(path);
+      if (current) return { workspaceId, projectName: await projectName(workspaceId), content: current.content, version: current.version };
+      const backup = await dependencies.documents.readText(`${path}.bak`);
+      if (!backup) return null;
+      return { workspaceId, projectName: await projectName(workspaceId), content: backup.content, version: null };
+    },
+    async saveContext(workspaceId, content, expectedVersion) {
+      validateContext(workspaceId, content);
+      await dependencies.documents.writeTextAtomic(`${workspaceId}.ccb`, content, expectedVersion);
+    },
+    async clearContext(workspaceId) {
+      const entries = (await dependencies.documents.list()).filter((entry) => CONTEXT_ARTIFACT.test(entry) && belongsToWorkspace(entry, workspaceId));
+      await removeContextArtifacts(entries);
+    },
     async setAutomation(enabled) {
       const request = ++automationRequest;
       // Disable intent takes effect before entering the persistence queue. An
@@ -167,9 +208,7 @@ export function createSettingsModel(dependencies: SettingsDependencies): Setting
       dependencies.download(path, current.content);
     },
     async clearCurrent() {
-      const path = await currentPath();
-      const entries = (await dependencies.documents.list()).filter((entry) => CONTEXT_ARTIFACT.test(entry) && (entry === path || entry.startsWith(`${path}.`)));
-      await removeContextArtifacts(entries);
+      await this.clearContext(await currentWorkspaceId());
     },
     async clearAll() {
       const entries = (await dependencies.documents.list()).filter((entry) => CONTEXT_ARTIFACT.test(entry));

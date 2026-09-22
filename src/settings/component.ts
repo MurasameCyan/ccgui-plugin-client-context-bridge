@@ -1,5 +1,5 @@
 import type { ReactLike } from "../sdk";
-import type { ContextDocumentSummary, SettingsModel, SettingsSnapshot } from "./model";
+import type { ContextDocument, ContextDocumentSummary, SettingsModel, SettingsSnapshot } from "./model";
 
 /** Plugin display name used by status surfaces and metadata. */
 export const DISPLAY_NAME = "Client Context Bridge (CCB)";
@@ -82,22 +82,6 @@ const ROW_DESCRIPTION: Record<string, unknown> = {
   lineHeight: BODY_2_LINE,
   color: TEXT_SECONDARY,
 };
-const CONTROL: Record<string, unknown> = {
-  boxSizing: "border-box",
-  height: "32px",
-  width: "202px",
-  minWidth: 0,
-  maxWidth: "100%",
-  flexShrink: 0,
-  padding: "0 8px",
-  borderRadius: "10px",
-  border: `1px solid ${FIELD_BORDER}`,
-  background: FIELD_BG,
-  color: TEXT_PRIMARY,
-  fontSize: BODY,
-  fontFamily: "inherit",
-  cursor: "pointer",
-};
 const BUTTON: Record<string, unknown> = {
   boxSizing: "border-box",
   height: "32px",
@@ -110,6 +94,8 @@ const BUTTON: Record<string, unknown> = {
   fontFamily: "inherit",
   cursor: "pointer",
 };
+const SMALL_BUTTON: Record<string, unknown> = { ...BUTTON, height: "28px", padding: "0 9px", fontSize: BODY_2 };
+const SMALL_DANGER_BUTTON: Record<string, unknown> = { ...SMALL_BUTTON, color: ERROR_TEXT };
 const DANGER_BUTTON: Record<string, unknown> = { ...BUTTON, color: ERROR_TEXT };
 /**
  * Pill switch, geometry 1:1 with the host's `sm` Switch (switch-sizes.ts):
@@ -221,6 +207,205 @@ const STATUS_LINE: Record<string, unknown> = {
   color: TEXT_PRIMARY,
 };
 
+const SELECT_WRAPPER: Record<string, unknown> = {
+  position: "relative",
+  width: "202px",
+  maxWidth: "100%",
+  flexShrink: 0,
+};
+const SELECT_TRIGGER = (open: boolean): Record<string, unknown> => ({
+  display: "flex",
+  boxSizing: "border-box",
+  width: "100%",
+  height: "32px",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: "6px",
+  padding: "0 10px",
+  border: `1px solid ${FIELD_BORDER}`,
+  borderRadius: "10px",
+  background: open ? FIELD_BG : "var(--color-background-primary-default, rgba(255,255,255,0.03))",
+  boxShadow: "0 1px 2px rgb(0 0 0 / 0.12)",
+  color: TEXT_PRIMARY,
+  font: "inherit",
+  fontSize: BODY,
+  textAlign: "left",
+  cursor: "pointer",
+  outline: "none",
+});
+const SELECT_MENU: Record<string, unknown> = {
+  position: "absolute",
+  zIndex: 20,
+  top: "36px",
+  right: 0,
+  display: "flex",
+  width: "266px",
+  maxWidth: "calc(100vw - 32px)",
+  maxHeight: "240px",
+  boxSizing: "border-box",
+  flexDirection: "column",
+  gap: "4px",
+  overflowY: "auto",
+  padding: "8px",
+  border: `1px solid ${FIELD_BORDER}`,
+  borderRadius: "16px",
+  background: "var(--color-background-primary-default, #171717)",
+  boxShadow: "0 12px 32px rgb(0 0 0 / 0.28)",
+};
+const SELECT_OPTION = (selected: boolean): Record<string, unknown> => ({
+  display: "flex",
+  width: "100%",
+  boxSizing: "border-box",
+  minHeight: "32px",
+  alignItems: "center",
+  padding: "7px 8px",
+  border: "none",
+  borderRadius: "10px",
+  background: selected ? "var(--color-dropdown-item-hover-background, rgba(255,255,255,0.10))" : "transparent",
+  color: TEXT_PRIMARY,
+  font: "inherit",
+  fontSize: BODY,
+  textAlign: "left",
+  cursor: "pointer",
+});
+const SELECT_CARET = (open: boolean): Record<string, unknown> => ({
+  width: 0,
+  height: 0,
+  flexShrink: 0,
+  borderTop: "4px solid transparent",
+  borderBottom: "4px solid transparent",
+  borderLeft: `5px solid ${TEXT_SECONDARY}`,
+  transform: open ? "rotate(-90deg)" : "rotate(90deg)",
+  transition: "transform 150ms ease",
+});
+
+interface SelectChoice { value: string; label: string }
+
+function createCcbSelect(react: ReactLike) {
+  return function CcbSelect({ label, value, options, onChange }: {
+    label: string;
+    value: string;
+    options: readonly SelectChoice[];
+    onChange: (value: string) => void;
+  }) {
+    const [open, setOpen] = react.useState(false);
+    react.useEffect(() => {
+      if (!open || typeof document === "undefined") return;
+      const closeOutside = (event: Event) => {
+        const target = event.target;
+        if (!(target instanceof Element) || !target.closest("[data-ccb-select]")) setOpen(false);
+      };
+      document.addEventListener("pointerdown", closeOutside);
+      return () => document.removeEventListener("pointerdown", closeOutside);
+    }, [open]);
+    const selected = options.find((option) => option.value === value) ?? options[0];
+    const choose = (next: string) => {
+      onChange(next);
+      setOpen(false);
+    };
+    return react.createElement("div", { "data-ccb-select": true, style: SELECT_WRAPPER },
+      react.createElement("button", {
+        type: "button",
+        role: "combobox",
+        "aria-label": label,
+        "aria-expanded": open,
+        "aria-haspopup": "listbox",
+        style: SELECT_TRIGGER(open),
+        onClick: () => setOpen(!open),
+        onKeyDown: (event: { key: string; preventDefault: () => void }) => {
+          if (event.key === "Escape") setOpen(false);
+          if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setOpen(true);
+          }
+        },
+      },
+        react.createElement("span", { style: { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, selected?.label ?? value),
+        react.createElement("span", { "aria-hidden": true, style: SELECT_CARET(open) }),
+      ),
+      open ? react.createElement("div", { role: "listbox", "aria-label": label, style: SELECT_MENU },
+        ...options.map((option) => react.createElement("button", {
+          key: option.value,
+          type: "button",
+          role: "option",
+          "aria-selected": option.value === value,
+          style: SELECT_OPTION(option.value === value),
+          onClick: () => choose(option.value),
+        }, option.label)),
+      ) : null,
+    );
+  };
+}
+
+const PROJECT_TONES = [
+  { line: "#60a5fa", background: "color-mix(in srgb, #2563eb 12%, transparent)" },
+  { line: "#a78bfa", background: "color-mix(in srgb, #7c3aed 12%, transparent)" },
+  { line: "#34d399", background: "color-mix(in srgb, #059669 12%, transparent)" },
+  { line: "#fbbf24", background: "color-mix(in srgb, #d97706 12%, transparent)" },
+  { line: "#f472b6", background: "color-mix(in srgb, #db2777 12%, transparent)" },
+  { line: "#fb7185", background: "color-mix(in srgb, #e11d48 12%, transparent)" },
+] as const;
+
+function projectTone(workspaceId: string) {
+  let hash = 0;
+  for (const character of workspaceId) hash = (hash * 31 + character.codePointAt(0)!) | 0;
+  return PROJECT_TONES[Math.abs(hash) % PROJECT_TONES.length];
+}
+
+const CONTEXT_ROW = (workspaceId: string): Record<string, unknown> => {
+  const tone = projectTone(workspaceId);
+  return {
+    display: "flex",
+    boxSizing: "border-box",
+    width: "100%",
+    minWidth: 0,
+    alignItems: "center",
+    gap: "10px",
+    padding: "8px 10px 8px 12px",
+    borderLeft: `4px solid ${tone.line}`,
+    borderRadius: "10px",
+    background: tone.background,
+  };
+};
+
+const DIALOG_BACKDROP: Record<string, unknown> = {
+  position: "fixed",
+  zIndex: 50,
+  inset: 0,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  padding: "24px",
+  background: "rgb(0 0 0 / 0.55)",
+};
+const DIALOG: Record<string, unknown> = {
+  display: "flex",
+  width: "min(720px, 100%)",
+  maxHeight: "min(760px, 100%)",
+  boxSizing: "border-box",
+  flexDirection: "column",
+  gap: "12px",
+  padding: "16px",
+  border: `1px solid ${FIELD_BORDER}`,
+  borderRadius: "16px",
+  background: "var(--color-background-primary-default, #171717)",
+  color: TEXT_PRIMARY,
+  boxShadow: "0 20px 60px rgb(0 0 0 / 0.35)",
+};
+const DIALOG_TEXTAREA: Record<string, unknown> = {
+  width: "100%",
+  minHeight: "360px",
+  boxSizing: "border-box",
+  resize: "vertical",
+  padding: "10px",
+  border: `1px solid ${FIELD_BORDER}`,
+  borderRadius: "10px",
+  background: FIELD_BG,
+  color: TEXT_PRIMARY,
+  fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace",
+  fontSize: "12px",
+  lineHeight: "18px",
+};
 export interface SettingsComponentOptions {
   react: ReactLike;
   model: SettingsModel;
@@ -231,6 +416,7 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
   const { react, model } = options;
   const zh = options.locale.toLowerCase().startsWith("zh");
   const text = (chinese: string, english: string) => zh ? chinese : english;
+  const Select = createCcbSelect(react);
 
   /** Label block of a row: primary label plus an optional secondary line. */
   const labelBlock = (label: string, description?: string) =>
@@ -267,6 +453,12 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
     const [preview, setPreview] = react.useState<string | null>(null);
     const [previewOpen, setPreviewOpen] = react.useState(false);
     const [contexts, setContexts] = react.useState<ContextDocumentSummary[] | null>(null);
+    const [contextDialog, setContextDialog] = react.useState<"view" | "edit" | null>(null);
+    const [contextDocument, setContextDocument] = react.useState<ContextDocument | null>(null);
+    const [editorValue, setEditorValue] = react.useState("");
+    const [contextError, setContextError] = react.useState("");
+    const [contextBusy, setContextBusy] = react.useState(false);
+    const [deleteTarget, setDeleteTarget] = react.useState<ContextDocumentSummary | null>(null);
     const [switchFocused, setSwitchFocused] = react.useState(false);
     react.useEffect(() => {
       let active = true;
@@ -277,10 +469,49 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
       return react.createElement("section", { className: "ccb-settings", "aria-busy": true, style: { ...SECTION, ...HINT } },
         message || text("正在加载…", "Loading…"));
     }
+    const refreshContexts = () => {
+      setContexts(null);
+      return model.listContexts().then(setContexts).catch((error: unknown) => {
+        setContexts([]);
+        setMessage(String(error));
+      });
+    };
+    const reloadSnapshot = () => model.load().then(setSnapshot);
     const run = (operation: () => Promise<void>) => {
       setMessage("");
       setPreview(null);
-      void operation().then(() => model.load()).then(setSnapshot).catch((error: unknown) => setMessage(String(error)));
+      void operation().then(reloadSnapshot).then(() => previewOpen ? refreshContexts() : undefined).catch((error: unknown) => setMessage(String(error)));
+    };
+    const openContext = (mode: "view" | "edit", summary: ContextDocumentSummary) => {
+      setContextDialog(mode);
+      setContextDocument(null);
+      setEditorValue("");
+      setContextError("");
+      setContextBusy(true);
+      void model.readContext(summary.workspaceId).then((document) => {
+        if (!document) throw new Error(text("该项目没有可读取的上下文。", "No readable context exists for this project."));
+        setContextDocument(document);
+        setEditorValue(document.content);
+      }).catch((error: unknown) => setContextError(String(error))).finally(() => setContextBusy(false));
+    };
+    const saveContext = () => {
+      if (!contextDocument) return;
+      setContextBusy(true);
+      setContextError("");
+      void model.saveContext(contextDocument.workspaceId, editorValue, contextDocument.version).then(async () => {
+        setSnapshot(await model.load());
+        if (previewOpen) setContexts(await model.listContexts());
+        setContextDialog(null);
+      }).catch((error: unknown) => setContextError(String(error))).finally(() => setContextBusy(false));
+    };
+    const confirmDelete = () => {
+      if (!deleteTarget) return;
+      setContextBusy(true);
+      setContextError("");
+      void model.clearContext(deleteTarget.workspaceId).then(async () => {
+        setDeleteTarget(null);
+        if (previewOpen) setContexts(await model.listContexts());
+      }).catch((error: unknown) => setContextError(String(error))).finally(() => setContextBusy(false));
     };
     const off = !snapshot.config.automationEnabled;
     const ttl = snapshot.config.ttlDays === null ? "never" : String(snapshot.config.ttlDays);
@@ -289,11 +520,10 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
       const nextOpen = !previewOpen;
       setPreviewOpen(nextOpen);
       if (!nextOpen) return;
-      setContexts(null);
+      setPreview(null);
       setMessage("");
-      void model.listContexts().then(setContexts).catch((error: unknown) => setMessage(String(error)));
+      void refreshContexts();
     };
-
     return react.createElement("section", { className: "ccb-settings", style: SECTION },
       // Group 1 — the global default and workspace overrides.
       react.createElement("div", { style: GROUP },
@@ -327,28 +557,32 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
       react.createElement("div", { style: GROUP },
         react.createElement("p", { style: GROUP_LABEL }, text("上下文存储", "Context storage")),
         react.createElement("div", { style: CARD },
-          row("location", false, true, [
+          row("location", false, false, [
             labelBlock(text("存储位置", "Storage location")),
-            react.createElement("select", {
-              style: CONTROL,
+            react.createElement(Select, {
+              label: text("存储位置", "Storage location"),
               value: snapshot.location,
-              onChange: (event: { currentTarget: { value: "data" | "program" | "custom" } }) => run(() => model.setLocation(event.currentTarget.value)),
-            },
-            react.createElement("option", { value: "data" }, text("CCGUI 数据目录", "CCGUI data directory")),
-            react.createElement("option", { value: "program" }, text("程序目录", "Program directory")),
-            react.createElement("option", { value: "custom" }, text("自定义目录", "Custom directory"))),
+              options: [
+                { value: "data", label: text("CCGUI 数据目录", "CCGUI data directory") },
+                { value: "program", label: text("程序目录", "Program directory") },
+                { value: "custom", label: text("自定义目录", "Custom directory") },
+              ],
+              onChange: (value: string) => run(() => model.setLocation(value as "data" | "program" | "custom")),
+            }),
           ]),
-          row("ttl", true, true, [
+          row("ttl", true, false, [
             labelBlock(text("上下文有效期", "Context TTL")),
-            react.createElement("select", {
-              style: CONTROL,
+            react.createElement(Select, {
+              label: text("上下文有效期", "Context TTL"),
               value: ttl,
-              onChange: (event: { currentTarget: { value: string } }) => run(() => model.setTtlDays(event.currentTarget.value === "never" ? null : Number(event.currentTarget.value))),
-            },
-            react.createElement("option", { value: "1" }, text("1 天", "1 day")),
-            react.createElement("option", { value: "7" }, text("7 天", "7 days")),
-            react.createElement("option", { value: "30" }, text("30 天", "30 days")),
-            react.createElement("option", { value: "never" }, text("永不过期", "No expiration"))),
+              options: [
+                { value: "1", label: text("1 天", "1 day") },
+                { value: "7", label: text("7 天", "7 days") },
+                { value: "30", label: text("30 天", "30 days") },
+                { value: "never", label: text("永不过期", "No expiration") },
+              ],
+              onChange: (value: string) => run(() => model.setTtlDays(value === "never" ? null : Number(value))),
+            }),
           ]),
         ),
         react.createElement("p", { style: HINT }, text("切换存储位置会暂停写入，并由宿主原子迁移属于此插件的全部文档。迁移失败会保留原位置与原设置。", "Switching the storage location pauses writes and atomically migrates all documents belonging to this plugin through the host. A failed migration keeps the previous location and settings.")),
@@ -386,8 +620,42 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
                 ? react.createElement("p", { style: HINT, "aria-live": "polite" }, text("正在加载…", "Loading…"))
                 : contexts.length === 0
                   ? react.createElement("p", { style: HINT }, text("暂无已存储项目", "No stored projects"))
-                  : react.createElement("ul", { "aria-label": text("已存储项目", "Stored projects"), style: { margin: 0, paddingLeft: "20px", color: TEXT_PRIMARY } },
-                    ...contexts.map((context) => react.createElement("li", { key: context.workspaceId, style: ROW_LABEL }, context.projectName)),
+                  : react.createElement("div", {
+                    role: "list",
+                    "aria-label": text("已存储项目", "Stored projects"),
+                    style: { display: "flex", flexDirection: "column", gap: "6px" },
+                  },
+                    ...contexts.map((context) => react.createElement("div", {
+                      key: context.workspaceId,
+                      role: "listitem",
+                      "data-context-row": true,
+                      style: CONTEXT_ROW(context.workspaceId),
+                    },
+                      react.createElement("span", { style: { minWidth: 0, flex: "1 1 auto", overflow: "hidden", color: TEXT_PRIMARY, textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: context.projectName }, context.projectName),
+                      react.createElement("div", { style: { display: "flex", flexShrink: 0, gap: "6px" } },
+                        react.createElement("button", {
+                          type: "button",
+                          "data-context-action": "view",
+                          "aria-label": text(`查看 ${context.projectName}`, `View ${context.projectName}`),
+                          style: SMALL_BUTTON,
+                          onClick: () => openContext("view", context),
+                        }, text("查看", "View")),
+                        react.createElement("button", {
+                          type: "button",
+                          "data-context-action": "edit",
+                          "aria-label": text(`编辑 ${context.projectName}`, `Edit ${context.projectName}`),
+                          style: SMALL_BUTTON,
+                          onClick: () => openContext("edit", context),
+                        }, text("编辑", "Edit")),
+                        react.createElement("button", {
+                          type: "button",
+                          "data-context-action": "delete",
+                          "aria-label": text(`删除 ${context.projectName}`, `Delete ${context.projectName}`),
+                          style: SMALL_DANGER_BUTTON,
+                          onClick: () => { setDeleteTarget(context); setContextError(""); },
+                        }, text("删除", "Delete")),
+                      ),
+                    )),
                   ),
             ),
             react.createElement("pre", { style: PREVIEW }, preview ?? snapshot.currentJson ?? text("暂无上下文", "No context")),
@@ -400,6 +668,56 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
         ),
         statusMessage ? react.createElement("p", { role: "status", style: STATUS_LINE }, statusMessage) : null,
       ),
+      contextDialog ? react.createElement("div", { style: DIALOG_BACKDROP },
+        react.createElement("div", {
+          role: "dialog",
+          "aria-modal": true,
+          "aria-label": contextDialog === "edit" ? text("编辑上下文", "Edit context") : text("查看上下文", "View context"),
+          style: DIALOG,
+        },
+          react.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" } },
+            react.createElement("strong", { style: ROW_LABEL }, contextDocument?.projectName ?? text("上下文", "Context")),
+            react.createElement("span", { style: ROW_DESCRIPTION }, contextDialog === "edit" ? text("编辑 JSON", "Edit JSON") : text("只读", "Read only")),
+          ),
+          contextBusy && !contextDocument ? react.createElement("p", { style: HINT, "aria-live": "polite" }, text("正在读取…", "Loading…")) : null,
+          contextError ? react.createElement("p", { role: "alert", style: { ...STATUS_LINE, color: ERROR_TEXT } }, contextError) : null,
+          contextDocument && contextDialog === "view"
+            ? react.createElement("pre", { style: { ...PREVIEW, maxHeight: "520px", minHeight: "240px", overflow: "auto" } }, contextDocument.content)
+            : null,
+          contextDocument && contextDialog === "edit"
+            ? react.createElement("textarea", {
+              "aria-label": text("上下文 JSON", "Context JSON"),
+              value: editorValue,
+              style: DIALOG_TEXTAREA,
+              spellCheck: false,
+              disabled: contextBusy,
+              onChange: (event: { currentTarget: { value: string } }) => setEditorValue(event.currentTarget.value),
+            })
+            : null,
+          react.createElement("div", { style: { ...ACTIONS, padding: 0, justifyContent: "flex-end" } },
+            react.createElement("button", { type: "button", style: BUTTON, disabled: contextBusy, onClick: () => { setContextDialog(null); setContextError(""); } }, text("关闭", "Close")),
+            contextDialog === "edit" && contextDocument
+              ? react.createElement("button", { type: "button", style: BUTTON, disabled: contextBusy, onClick: saveContext }, text("保存", "Save"))
+              : null,
+          ),
+        ),
+      ) : null,
+      deleteTarget ? react.createElement("div", { style: DIALOG_BACKDROP },
+        react.createElement("div", {
+          role: "dialog",
+          "aria-modal": true,
+          "aria-label": text("删除上下文", "Delete context"),
+          style: DIALOG,
+        },
+          react.createElement("strong", { style: ROW_LABEL }, text(`删除「${deleteTarget.projectName}」的上下文？`, `Delete context for “${deleteTarget.projectName}”?`)),
+          react.createElement("p", { style: HINT }, text("将删除该项目的主文件、备份和冲突文件，其他项目不受影响。", "This removes the project's primary, backup, and conflict files. Other projects are unchanged.")),
+          contextError ? react.createElement("p", { role: "alert", style: { ...STATUS_LINE, color: ERROR_TEXT } }, contextError) : null,
+          react.createElement("div", { style: { ...ACTIONS, padding: 0, justifyContent: "flex-end" } },
+            react.createElement("button", { type: "button", style: BUTTON, disabled: contextBusy, onClick: () => { setDeleteTarget(null); setContextError(""); } }, text("取消", "Cancel")),
+            react.createElement("button", { type: "button", style: DANGER_BUTTON, disabled: contextBusy, onClick: confirmDelete }, text("删除", "Delete")),
+          ),
+        ),
+      ) : null,
     );
   };
 }
