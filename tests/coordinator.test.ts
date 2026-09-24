@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { createEmptyEnvelope } from "../src/protocol/schema";
+import { createEmptyEnvelope, parseCcbEnvelope } from "../src/protocol/schema";
 import { ClientContextCoordinator, type CoordinatorClock } from "../src/coordinator/coordinator";
-import type { BeforeTurnEvent, DocumentStorage, InternalMessageEvent, PluginContext, RuntimeSwitchHooks, TurnHooks } from "../src/sdk";
+import type { BeforeTurnEvent, DocumentStorage, InternalMessageEvent, PluginContext, RuntimeSwitchHooks, SessionHooks, TurnHooks } from "../src/sdk";
 
 class MemoryDocuments implements DocumentStorage {
   readonly files = new Map<string, { content: string; version: string }>();
@@ -238,6 +238,7 @@ describe("client context coordinator", () => {
     const turnHooks = h.registered.turn as { beforeTurn(event: typeof turn): Promise<{ promptContributions?: TestContribution[]; internalMessageCapture?: { nonce?: string; maxBytes: number; validate?: (payload: unknown) => boolean } }>; afterTurn(event: unknown): Promise<void> };
     const sessionHooks = h.registered.session as { onCreated(event: unknown): void };
     const first = await turnHooks.beforeTurn(turn);
+    first.promptContributions?.find((entry) => entry.id === `ccb-protocol-${turn.turnId}`)?.onAccepted?.();
     sessionHooks.onCreated({ engine: "claude", sessionId: "native-1", workspace, occurredAt: turn.occurredAt });
     // The host settles every turn before the next send, and afterTurn is what
     // converts the pending first-turn marker into the native session identity.
@@ -245,7 +246,7 @@ describe("client context coordinator", () => {
     const second = await turnHooks.beforeTurn({ ...turn, turnId: "turn-2", sessionId: "native-1" });
     const firstProtocol = first.promptContributions?.find((entry) => entry.id === `ccb-protocol-${turn.turnId}`)?.content ?? "";
     const secondProtocol = second.promptContributions?.find((entry) => entry.id === "ccb-protocol-turn-2")?.content ?? "";
-    expect(firstProtocol).toContain("语义 patch");
+    expect(firstProtocol).toContain('"patch":{');
     expect(firstProtocol).toContain(NONCE);
     for (const field of ["acceptanceIds", "constraintIds", "completedIds", "remainingIds", "decisionIds", "riskIds"]) expect(firstProtocol).toContain(field);
     expect(firstProtocol).toContain("acceptance-a1");
@@ -528,14 +529,90 @@ describe("client context coordinator", () => {
     const sessionHooks = h.registered.session as { onCreated(event: unknown): void };
     const turnHooks = h.registered.turn as { beforeTurn(event: typeof turn): Promise<{ promptContributions?: TestContribution[] }>; afterTurn(event: unknown): Promise<void> };
     const first = await turnHooks.beforeTurn({ ...turn, runId: "pending-run", turnId: "pending-turn", sessionId: null });
+    first.promptContributions?.find((entry) => entry.id === "ccb-protocol-pending-turn")?.onAccepted?.();
     sessionHooks.onCreated({ engine: "claude", sessionId: "native-session", workspace, occurredAt: turn.occurredAt });
     // afterTurn deliberately carries a different runId than beforeTurn: the host
     // rekeys the lifecycle onto the engine's real run id once the launch
     // resolves, so turnId is the only key that survives the same turn.
     await turnHooks.afterTurn({ ...turn, runId: "real-run", turnId: "pending-turn", sessionId: "native-session", status: "completed" });
     const identified = await turnHooks.beforeTurn({ ...turn, runId: "real-run-2", turnId: "native-turn", sessionId: "native-session" });
-    expect(first.promptContributions?.find((entry) => entry.id === "ccb-protocol-pending-turn")?.content).toContain("语义 patch");
-    expect(identified.promptContributions?.find((entry) => entry.id === "ccb-protocol-native-turn")?.content).not.toContain("语义 patch");
+    expect(first.promptContributions?.find((entry) => entry.id === "ccb-protocol-pending-turn")?.content).toContain('"patch":{');
+    expect(identified.promptContributions?.find((entry) => entry.id === "ccb-protocol-native-turn")?.content).not.toContain('"patch":{');
+  });
+
+  it("teaches an unserved restored session the schema and persists its first patch", async () => {
+    const h = harness();
+    h.coordinator.enable();
+    const sessions = h.registered.session as SessionHooks;
+    const hooks = h.registered.turn as TurnHooks;
+    const resumed = { ...turn, turnId: "resumed-turn", sessionId: "pre-existing" };
+    // Native history may predate the plugin; restoration proves no delivery.
+    await sessions.onRestored!(resumed);
+    const result = await hooks.beforeTurn!(resumed);
+    const protocol = result?.promptContributions?.find((entry) => entry.id === "ccb-protocol-resumed-turn");
+    expect(protocol?.content).toContain('"patch":{');
+    expect(protocol?.content).toContain(`<CCGUI_INTERNAL_${NONCE}>`);
+    expect(protocol?.content).toContain(`</CCGUI_INTERNAL_${NONCE}>`);
+    protocol?.onAccepted?.();
+    hooks.onInternalMessage!({ ...resumed, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { goal: "Continue the restored task" } }) });
+    await hooks.afterTurn!({ ...resumed, status: "completed" });
+    const saved = parseCcbEnvelope(h.documents.files.get(`${workspace.id}.ccb`)!.content);
+    expect(saved.task.goal).toBe("Continue the restored task");
+    expect(saved.source.nativeSessionId).toBe(resumed.sessionId);
+    expect(h.documents.writes).toBe(1);
+  });
+
+  it("creates context when a new native session is enabled after earlier turns ran with CCB off", async () => {
+    const h = harness();
+    h.turnOff(workspace.id);
+    h.coordinator.enable();
+    const sessions = h.registered.session as SessionHooks;
+    const hooks = h.registered.turn as TurnHooks;
+    const existing = { ...turn, sessionId: "new-native-session" };
+    await sessions.onCreated!(existing);
+    for (const turnId of ["before-enable-1", "before-enable-2"]) {
+      expect(await hooks.beforeTurn!({ ...existing, turnId })).toBeUndefined();
+      await hooks.afterTurn!({ ...existing, turnId, status: "completed" });
+    }
+    expect(h.documents.files.has(`${workspace.id}.ccb`)).toBe(false);
+    h.turnOn(workspace.id);
+    const enabled = { ...existing, turnId: "first-enabled-turn" };
+    const result = await hooks.beforeTurn!(enabled);
+    const protocol = result?.promptContributions?.find((entry) => entry.id === "ccb-protocol-first-enabled-turn");
+    expect(protocol?.content).toContain('"patch":{');
+    expect(protocol?.content).toContain(`<CCGUI_INTERNAL_${NONCE}>`);
+    protocol?.onAccepted?.();
+    hooks.onInternalMessage!({ ...enabled, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { goal: "Continue the ongoing task" } }) });
+    await hooks.afterTurn!({ ...enabled, status: "completed" });
+    const saved = parseCcbEnvelope(h.documents.files.get(`${workspace.id}.ccb`)!.content);
+    expect(saved.task.goal).toBe("Continue the ongoing task");
+    expect(saved.source.nativeSessionId).toBe(existing.sessionId);
+    expect(h.documents.writes).toBe(1);
+  });
+
+  it("does not treat an observed in-flight turn as a delivered protocol", async () => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as TurnHooks;
+    const observed = { ...turn, sessionId: "already-running" };
+    // CCB was enabled after this request started, so beforeTurn never ran.
+    hooks.onRuntimeEvent!({ ...observed, eventId: "observed-end", workspaceId: workspace.id, workspacePath: workspace.path, kind: "assistant-completed" });
+    await hooks.afterTurn!({ ...observed, status: "completed" });
+    const saved = parseCcbEnvelope(h.documents.files.get(`${workspace.id}.ccb`)!.content);
+    expect(saved.provenance.degradedReasons).toContain("semantic-update-missing");
+    const next = await hooks.beforeTurn!({ ...observed, turnId: "first-instructed-turn" });
+    expect(next?.promptContributions?.[0].content).toContain('"patch":{');
+  });
+
+  it.each([null, "native-session"])("reoffers the schema when the first contribution was not accepted (session %s)", async (sessionId) => {
+    const h = harness();
+    h.coordinator.enable();
+    const hooks = h.registered.turn as TurnHooks;
+    await hooks.beforeTurn!({ ...turn, sessionId });
+    // Budget rejection or launch failure does not invoke onAccepted.
+    await hooks.afterTurn!({ ...turn, sessionId: "native-session", status: "failed", error: "launch failed" });
+    const retry = await hooks.beforeTurn!({ ...turn, sessionId: "native-session", turnId: "retry" });
+    expect(retry?.promptContributions?.[0].content).toContain('"patch":{');
   });
 
   it("isolates concurrent pending sessions until each receives a native identity", async () => {
@@ -546,16 +623,18 @@ describe("client context coordinator", () => {
       turnHooks.beforeTurn({ ...turn, runId: "left-run", turnId: "left-turn", sessionId: null }),
       turnHooks.beforeTurn({ ...turn, runId: "right-run", turnId: "right-turn", sessionId: null }),
     ]);
-    expect(left.promptContributions?.find((entry) => entry.id === "ccb-protocol-left-turn")?.content).toContain("语义 patch");
-    expect(right.promptContributions?.find((entry) => entry.id === "ccb-protocol-right-turn")?.content).toContain("语义 patch");
+    expect(left.promptContributions?.find((entry) => entry.id === "ccb-protocol-left-turn")?.content).toContain('"patch":{');
+    expect(right.promptContributions?.find((entry) => entry.id === "ccb-protocol-right-turn")?.content).toContain('"patch":{');
+    left.promptContributions?.find((entry) => entry.id === "ccb-protocol-left-turn")?.onAccepted?.();
+    right.promptContributions?.find((entry) => entry.id === "ccb-protocol-right-turn")?.onAccepted?.();
 
     await turnHooks.afterTurn({ ...turn, runId: "left-real", turnId: "left-turn", sessionId: "left-session", status: "completed" });
     await turnHooks.afterTurn({ ...turn, runId: "right-real", turnId: "right-turn", sessionId: "right-session", status: "completed" });
 
     const leftNative = await turnHooks.beforeTurn({ ...turn, runId: "left-run-2", turnId: "left-native", sessionId: "left-session" });
     const rightNative = await turnHooks.beforeTurn({ ...turn, runId: "right-run-2", turnId: "right-native", sessionId: "right-session" });
-    expect(leftNative.promptContributions?.find((entry) => entry.id === "ccb-protocol-left-native")?.content).not.toContain("语义 patch");
-    expect(rightNative.promptContributions?.find((entry) => entry.id === "ccb-protocol-right-native")?.content).not.toContain("语义 patch");
+    expect(leftNative.promptContributions?.find((entry) => entry.id === "ccb-protocol-left-native")?.content).not.toContain('"patch":{');
+    expect(rightNative.promptContributions?.find((entry) => entry.id === "ccb-protocol-right-native")?.content).not.toContain('"patch":{');
   });
 
   it("persists host git facts and warns when the live Git HEAD differs from the handoff", async () => {

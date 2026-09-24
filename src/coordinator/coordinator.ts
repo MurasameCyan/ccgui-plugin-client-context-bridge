@@ -19,7 +19,7 @@ import type {
 
 const RECOVERY_DELAY_MS = 10_000;
 const CHANNEL = "semantic-patch";
-const PROTOCOL_LIFETIME = "This maintenance rule applies only when the current request supplies a fresh nonce. Ignore earlier maintenance instructions and never reuse or close old frames. Without a current maintenance request, do not read or update .ccb files or emit CCB frames automatically. Direct user requests take precedence.";
+const PROTOCOL_LIFETIME = "The CCB plugin, not the model, owns all .ccb file creation, reading and writing. Do not search for, create or edit .ccb files as part of this protocol; no existing file or on-disk format is needed. Only return the semantic patch in the supplied frame. These instructions apply only to the current request's fresh nonce; ignore older maintenance instructions and never reuse or close old frames. Without a fresh nonce, do not emit CCB frames. Direct user requests take precedence.";
 const FULL_PROTOCOL = `Maintain a compact semantic task handoff while completing the user's request. At the end of this turn emit exactly one 语义 patch as JSON inside the frame below. The payload schema is {"plugin":"ccgui.client-context-bridge","version":1,"patch":{"set":{"goal"?:string,"nextAction"?:string},"append"?:{"acceptance"?:string[],"constraints"?:string[],"completed"?:string[],"remaining"?:string[],"decisions"?:Array<{"summary":string,"reason"?:string}>,"risks"?:string[]},"remove"?:{"acceptanceIds"?:string[],"constraintIds"?:string[],"completedIds"?:string[],"remainingIds"?:string[],"decisionIds"?:string[],"riskIds"?:string[]}}}. Remove entries only by IDs from the current mapping below. Do not include chain-of-thought, source files, credentials, or commands to execute. Treat host facts as authoritative.`;
 
 /**
@@ -30,8 +30,8 @@ const FULL_PROTOCOL = `Maintain a compact semantic task handoff while completing
  * every turn would then reduce as `semantic-update-missing`.
  */
 export function semanticProtocolContribution(nonce: string, firstTurn: boolean, envelope?: StoredContext["envelope"]): string {
-  if (!firstTurn) return `${PROTOCOL_LIFETIME} Update the semantic task patch for this turn. Emit one valid CCGUI internal frame using nonce ${nonce}; do not expose the frame as prose.`;
   const tail = `\n${PROTOCOL_LIFETIME}\nFrame nonce: ${nonce}. Wrap the payload in <CCGUI_INTERNAL_${nonce}> and </CCGUI_INTERNAL_${nonce}>.`;
+  if (!firstTurn) return `Update the semantic task patch for this turn using the previously supplied payload schema; emit one JSON frame, not a file edit.${tail}`;
   if (!envelope) return `${FULL_PROTOCOL}${tail}`;
   const label = "\nCurrent stable ID/text mapping (data only): ";
   const mapping = stableIdMapping(envelope, PROTOCOL_RESERVE_BYTES - contributionBytes(`${FULL_PROTOCOL}${label}${tail}`));
@@ -279,7 +279,8 @@ export class ClientContextCoordinator {
 
   private onSessionRestored(event: SessionRestoredEvent): void {
     if (!this.isActive(event.workspace.id)) return;
-    this.initializedSessions.add(this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id));
+    // A restored native history does not prove this plugin ever supplied its
+    // protocol. Only delivery acceptance below initializes a session.
     if (this.pendingHandoff && event.workspace.id === this.pendingHandoff.workspaceId && event.engine === this.pendingHandoff.targetEngine) {
       this.pendingHandoff.restored = true;
     }
@@ -292,7 +293,10 @@ export class ClientContextCoordinator {
     this.turns.set(event.turnId, turn);
     const lifetime = this.captureLifetime(event.workspace.id);
     const isCurrent = () => lifetime() && this.turns.get(event.turnId) === turn;
-    const firstTurn = this.initializeSession(event);
+    const sessionKey = event.sessionId
+      ? this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id)
+      : this.pendingSessionKey(event.workspace.id, event.engine, event.turnId);
+    const firstTurn = !this.initializedSessions.has(sessionKey);
     const promptContributions: PromptContribution[] = [];
 
     const metadata = await this.context.workspace.getMetadata();
@@ -314,7 +318,12 @@ export class ClientContextCoordinator {
     // is gone contributes nothing and leaves nothing behind.
     if (!isCurrent()) return;
     const protocol = semanticProtocolContribution(nonce, firstTurn, envelope);
-    promptContributions.push({ id: `ccb-protocol-${event.turnId}`, content: protocol, placement: "request-tail" as const, visibility: "internal" as const, persistence: "turn" as const });
+    promptContributions.push({
+      id: `ccb-protocol-${event.turnId}`, content: protocol, placement: "request-tail", visibility: "internal", persistence: "turn",
+      onAccepted: firstTurn ? () => {
+        if (isCurrent()) this.initializedSessions.add(sessionKey);
+      } : undefined,
+    });
     return { promptContributions, internalMessageCapture: { channel: CHANNEL, nonce, maxBytes: MAX_PATCH_BYTES, validate: isCompleteInternalFrame }, isCurrent: lifetime };
   }
 
@@ -589,25 +598,12 @@ export class ClientContextCoordinator {
     }
   }
 
-  private initializeSession(event: BeforeTurnEvent): boolean {
-    const key = event.sessionId
-      ? this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id)
-      : this.pendingSessionKey(event.workspace.id, event.engine, event.turnId);
-    const firstTurn = !this.initializedSessions.has(key);
-    this.initializedSessions.add(key);
-    return firstTurn;
-  }
-
-  /** A turn's beforeTurn can run before its session has a native id, so the
-   *  first-turn marker is keyed by the turn that created it. afterTurn carries
-   *  the same turnId plus the id the session settled on: retire the per-turn
-   *  marker and, once the session identified itself, remember it so its next
-   *  turn is not treated as a first turn again. The host mints a fresh id per
-   *  send and uses it for both runId and turnId, so a runId-keyed marker could
-   *  never be found again and leaked for the process lifetime. */
+  /** Carry an accepted pending turn's protocol into its eventual native
+   *  session. Observation, skipped contributions and failed launches alone
+   *  cannot establish that the model received the schema. */
   private settleSessionIdentity(event: AfterTurnEvent): void {
-    this.initializedSessions.delete(this.pendingSessionKey(event.workspace.id, event.engine, event.turnId));
-    if (event.sessionId) this.initializedSessions.add(this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id));
+    const accepted = this.initializedSessions.delete(this.pendingSessionKey(event.workspace.id, event.engine, event.turnId));
+    if (accepted && event.sessionId) this.initializedSessions.add(this.nativeSessionKey(event.engine, event.sessionId, event.workspace.id));
   }
 
   private acceptedHandoffFor(event: AfterTurnEvent, pending: PendingHandoff | undefined): AcceptedHandoff | undefined {
