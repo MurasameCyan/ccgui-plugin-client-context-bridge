@@ -1,3 +1,4 @@
+import type { CoordinatorStatus } from "../coordinator/coordinator";
 import type { ReactLike } from "../sdk";
 import type { ContextDocument, ContextDocumentSummary, SettingsModel, SettingsSnapshot } from "./model";
 
@@ -25,6 +26,9 @@ const FIELD_BG = "var(--color-background-tertiary-default, rgba(255,255,255,0.08
 const FIELD_BORDER = "var(--color-border-button-default, rgba(255,255,255,0.12))";
 const SEPARATOR = "var(--color-separator-border, rgba(255,255,255,0.08))";
 const ERROR_TEXT = "var(--color-text-error-primary, #f87171)";
+const WARNING_TEXT = "var(--color-text-warning-primary, #fdba74)";
+const SUCCESS_TEXT = "var(--color-notification-success-foreground, #a3e635)";
+const TEXT_TERTIARY = "var(--color-text-tertiary, #737373)";
 const ACCENT = "var(--color-accent-500, #3b82f6)";
 const ACCENT_STRONG = "var(--color-accent-600, #2563eb)";
 const THUMB = "var(--color-control-indicator-background, #fff)";
@@ -206,6 +210,42 @@ const STATUS_LINE: Record<string, unknown> = {
   lineHeight: BODY_2_LINE,
   color: TEXT_PRIMARY,
 };
+
+/**
+ * The six coordinator states from the design's "轻量状态指示", each with the
+ * tone it reads as: a write failure is an error, a degraded envelope is a
+ * warning, and an accepted handoff is the one state worth accenting.
+ */
+const STATUS_LABELS: Record<CoordinatorStatus, { zh: string; en: string; color: string }> = {
+  synced: { zh: "已同步", en: "Synced", color: SUCCESS_TEXT },
+  pending: { zh: "等待同步", en: "Pending sync", color: TEXT_SECONDARY },
+  degraded: { zh: "已降级", en: "Degraded", color: WARNING_TEXT },
+  "write-failed": { zh: "写入失败", en: "Write failed", color: ERROR_TEXT },
+  continued: { zh: "已从其他客户端接续", en: "Continued from another client", color: ACCENT },
+  off: { zh: "已关闭", en: "Off", color: TEXT_TERTIARY },
+};
+const STATUS_CHIP = (color: string): Record<string, unknown> => ({
+  display: "inline-flex",
+  boxSizing: "border-box",
+  height: "24px",
+  flexShrink: 0,
+  alignItems: "center",
+  gap: "6px",
+  padding: "0 10px",
+  borderRadius: "999px",
+  border: `1px solid ${FIELD_BORDER}`,
+  background: FIELD_BG,
+  color,
+  fontSize: BODY_2,
+  lineHeight: BODY_2_LINE,
+  whiteSpace: "nowrap",
+});
+const STATUS_DOT = (color: string): Record<string, unknown> => ({
+  width: "6px",
+  height: "6px",
+  borderRadius: "999px",
+  background: color,
+});
 
 const SELECT_WRAPPER: Record<string, unknown> = {
   position: "relative",
@@ -410,6 +450,15 @@ export interface SettingsComponentOptions {
   react: ReactLike;
   model: SettingsModel;
   locale: string;
+  /**
+   * Live coordinator status. The owner holds the authoritative value (it is
+   * updated outside React, on every flush and handoff), so the section reads
+   * it once on mount and then follows the subscription.
+   */
+  status: {
+    current(): CoordinatorStatus;
+    subscribe(listener: (status: CoordinatorStatus) => void): () => void;
+  };
 }
 
 export function createSettingsComponent(options: SettingsComponentOptions) {
@@ -460,6 +509,8 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
     const [contextBusy, setContextBusy] = react.useState(false);
     const [deleteTarget, setDeleteTarget] = react.useState<ContextDocumentSummary | null>(null);
     const [switchFocused, setSwitchFocused] = react.useState(false);
+    const [status, setStatus] = react.useState<CoordinatorStatus>(() => options.status.current());
+    react.useEffect(() => options.status.subscribe(setStatus), []);
     react.useEffect(() => {
       let active = true;
       void model.load().then((value) => { if (active) setSnapshot(value); }).catch((error: unknown) => { if (active) setMessage(String(error)); });
@@ -528,7 +579,7 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
       // Group 1 — the global default and workspace overrides.
       react.createElement("div", { style: GROUP },
         react.createElement("div", { style: CARD },
-          row("automation", true, true, [
+          row("automation", false, true, [
             labelBlock(
               text("全局启用跨客户端上下文桥接", "Enable client context bridge globally"),
               off
@@ -547,6 +598,21 @@ export function createSettingsComponent(options: SettingsComponentOptions) {
                 onFocus: (event: { currentTarget: { matches(selector: string): boolean } }) => setSwitchFocused(event.currentTarget.matches(":focus-visible")),
                 onBlur: () => setSwitchFocused(false),
               }),
+            ),
+          ]),
+          row("status", true, false, [
+            labelBlock(
+              text("桥接状态", "Bridge status"),
+              text("最近一次上下文同步的结果。", "Result of the most recent context sync."),
+            ),
+            react.createElement("span", {
+              role: "status",
+              "aria-live": "polite",
+              "data-ccb-status": status,
+              style: STATUS_CHIP(STATUS_LABELS[status].color),
+            },
+              react.createElement("span", { "aria-hidden": true, style: STATUS_DOT(STATUS_LABELS[status].color) }),
+              zh ? STATUS_LABELS[status].zh : STATUS_LABELS[status].en,
             ),
           ]),
         ),

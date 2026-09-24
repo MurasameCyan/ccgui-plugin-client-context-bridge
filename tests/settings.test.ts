@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { CoordinatorStatus } from "../src/coordinator/coordinator";
 import { createEmptyEnvelope } from "../src/protocol/schema";
 import type { ReactLike, RegisteredWorkspace } from "../src/sdk";
 import { createSettingsComponent } from "../src/settings/component";
@@ -505,6 +506,26 @@ function fakeReact() {
   };
 }
 
+/** Stands in for the activation owner's status holder. */
+function fakeStatus(initial: CoordinatorStatus = "off") {
+  let current = initial;
+  const listeners = new Set<(status: CoordinatorStatus) => void>();
+  return {
+    source: {
+      current: () => current,
+      subscribe: (listener: (status: CoordinatorStatus) => void) => {
+        listeners.add(listener);
+        return () => { listeners.delete(listener); };
+      },
+    },
+    listenerCount: () => listeners.size,
+    publish(next: CoordinatorStatus) {
+      current = next;
+      for (const listener of [...listeners]) listener(next);
+    },
+  };
+}
+
 describe("settings component", () => {
   it("shows active workspace context without checking the global-default switch", async () => {
     type Element = { type: unknown; props: Record<string, unknown> & { children: unknown[] } };
@@ -520,7 +541,7 @@ describe("settings component", () => {
     const content = envelope("w", 2, "2026-09-13T10:00:00.000Z");
     const harness = settingsHarness({ automation: false, workspaceEnabled: true, files: [["w.ccb", { content, version: "4" }]] });
     const fake = fakeReact();
-    const current = fake.mount(createSettingsComponent({ react: fake.react, model: createSettingsModel(harness.dependencies), locale: "en-US" }));
+    const current = fake.mount(createSettingsComponent({ react: fake.react, model: createSettingsModel(harness.dependencies), locale: "en-US", status: fakeStatus().source }));
     await vi.waitFor(() => expect(findElement(current(), (element) => element.props.role === "switch")).toBeDefined());
     expect(findElement(current(), (element) => element.props.role === "switch")!.props.checked).toBe(false);
     expect(findElement(current(), (element) => element.type === "output")).toBeUndefined();
@@ -555,7 +576,7 @@ describe("settings component", () => {
       ],
     });
     const fake = fakeReact();
-    const current = fake.mount(createSettingsComponent({ react: fake.react, model: createSettingsModel(harness.dependencies), locale: "en-US" }));
+    const current = fake.mount(createSettingsComponent({ react: fake.react, model: createSettingsModel(harness.dependencies), locale: "en-US", status: fakeStatus().source }));
     await vi.waitFor(() => expect(findAll(current(), (element) => element.props.role === "switch")).toHaveLength(1));
     expect(findAll(current(), (element) => element.props["data-context-row"] === true)).toHaveLength(0);
     const disclosure = findAll(current(), (element) => element.type === "button" && element.props["aria-expanded"] === false)[0];
@@ -567,5 +588,45 @@ describe("settings component", () => {
     expect(findAll(rows[0], (element) => element.props["data-context-action"] === "edit")).toHaveLength(1);
     expect(findAll(rows[0], (element) => element.props["data-context-action"] === "delete")).toHaveLength(1);
   });
+
+it("shows the current bridge status and follows later coordinator updates", async () => {
+  type Element = { type: unknown; props: Record<string, unknown> & { children: unknown[] } };
+  const findElement = (node: unknown, matches: (element: Element) => boolean): Element | undefined => {
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = findElement(child, matches);
+        if (found) return found;
+      }
+      return undefined;
+    }
+    if (!node || typeof node !== "object" || !("props" in node)) return undefined;
+    const element = node as Element;
+    if (matches(element)) return element;
+    for (const child of element.props.children) {
+      const found = findElement(child, matches);
+      if (found) return found;
+    }
+  };
+  const chip = (tree: unknown) => findElement(tree, (element) => element.props["data-ccb-status"] !== undefined);
+  const harness = settingsHarness({ automation: true, workspaceEnabled: true });
+  const status = fakeStatus("pending");
+  const fake = fakeReact();
+  const current = fake.mount(createSettingsComponent({
+    react: fake.react,
+    model: createSettingsModel(harness.dependencies),
+    locale: "en-US",
+    status: status.source,
+  }));
+  await vi.waitFor(() => expect(chip(current())).toBeDefined());
+  expect(chip(current())!.props["data-ccb-status"]).toBe("pending");
+  expect(chip(current())!.props.children).toContain("Pending sync");
+
+  status.publish("continued");
+  expect(chip(current())!.props["data-ccb-status"]).toBe("continued");
+  expect(chip(current())!.props.children).toContain("Continued from another client");
+
+  status.publish("write-failed");
+  expect(chip(current())!.props.children).toContain("Write failed");
+});
 
 

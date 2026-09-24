@@ -14,7 +14,16 @@ export default function activate(context: PluginContext): Disposer {
   /** Explicit workspace choices override the global default in either direction. */
   let overrides: Record<string, boolean> = {};
   const zh = context.host.locale.toLowerCase().startsWith("zh");
+  /** Latest visible status and its local subscribers. The event topic stays the
+   *  cross-plugin channel; the settings section renders from this same value so
+   *  it never has to subscribe to its own broadcast. */
   let status: CoordinatorStatus = "off";
+  const statusListeners = new Set<(status: CoordinatorStatus) => void>();
+  const publishStatus = (next: CoordinatorStatus) => {
+    status = next;
+    context.events.emit(STATUS_TOPIC, next);
+    for (const listener of [...statusListeners]) listener(next);
+  };
   let disposed = false;
   let settingsReady = false;
   let automationEnabled = false;
@@ -24,7 +33,7 @@ export default function activate(context: PluginContext): Disposer {
   const coordinator = new ClientContextCoordinator(context, {
     ttlDays: () => config.ttlDays,
     workspaceEnabled,
-    onStatus: (next) => { status = next; context.events.emit(STATUS_TOPIC, next); },
+    onStatus: publishStatus,
   });
   const hasEnabledWorkspace = () => automationEnabled || Object.values(overrides).includes(true);
   const refreshOperations = () => {
@@ -53,14 +62,14 @@ export default function activate(context: PluginContext): Disposer {
         try {
           await context.documentStorage.getLocation();
         } catch {
-          status = "degraded";
+          publishStatus("degraded");
         }
         if (disposed) return;
         refreshOperations();
       }
       settingsReady = true;
     });
-  ready.catch(() => { if (disposed) return; status = "degraded"; context.events.emit(STATUS_TOPIC, status); });
+  ready.catch(() => { if (disposed) return; publishStatus("degraded"); });
   const saveConfig = async (next: BridgeConfig) => {
     if (disposed) throw new Error("Plugin has been disposed");
     await context.storage.set(CONFIG_KEY, next);
@@ -87,10 +96,7 @@ export default function activate(context: PluginContext): Disposer {
         refreshOperations();
       }
     }).catch((error: unknown) => {
-      if (!disposed) {
-        status = "degraded";
-        context.events.emit(STATUS_TOPIC, status);
-      }
+      if (!disposed) publishStatus("degraded");
       throw error;
     }).finally(() => {
       if (!enabled) {
@@ -129,16 +135,25 @@ export default function activate(context: PluginContext): Disposer {
   // smaller wherever it shows a plugin name.
   disposers.push(context.i18n.addBundle("zh-CN", "client-context-bridge", {
     title: DISPLAY_NAME,
-    status: { synced: "已同步", pending: "等待同步", degraded: "已降级", writeFailed: "写入失败", continued: "已从其他客户端接续", off: "已关闭" },
   }));
   disposers.push(context.i18n.addBundle("en-US", "client-context-bridge", {
     title: DISPLAY_NAME,
-    status: { synced: "Synced", pending: "Pending sync", degraded: "Degraded", writeFailed: "Write failed", continued: "Continued from another client", off: "Off" },
   }));
   disposers.push(context.ui.registerSettingsSection({
     key: "settings",
     label: () => SETTINGS_DISPLAY_NAME,
-    component: createSettingsComponent({ react: context.react, model, locale: context.host.locale }),
+    component: createSettingsComponent({
+      react: context.react,
+      model,
+      locale: context.host.locale,
+      status: {
+        current: () => status,
+        subscribe: (listener) => {
+          statusListeners.add(listener);
+          return () => { statusListeners.delete(listener); };
+        },
+      },
+    }),
   }));
   let renderedAction: { workspaceId: string; enabled: boolean } | undefined;
   disposers.push(context.ui.registerWorkspaceMenuItem({
@@ -171,6 +186,7 @@ export default function activate(context: PluginContext): Disposer {
   return () => {
     disposed = true;
     coordinator.disable();
+    statusListeners.clear();
     for (const dispose of disposers.splice(0).reverse()) dispose();
   };
 }
