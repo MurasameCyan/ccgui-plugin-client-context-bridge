@@ -3,7 +3,7 @@
   "name": "Client Context Bridge (CCB)",
   "version": "1.0.0",
   "minAppVersion": "1.0.0",
-  "sdkVersion": "0.3.12",
+  "sdkVersion": ">=0.3.12",
   "description": "在不同 AI CLI 客户端之间传递当前任务的可执行上下文。",
   "tier": "js",
   "permissions": [

@@ -2,8 +2,8 @@
 // Exits non-zero on any drift; never uses `as any`, `@ts-ignore`, or a
 // string allowlist to pass. Verifies three things a manual sync can silently
 // get wrong:
-//   1. manifest.sdkVersion is an EXACT x.y.z pin (no ^, ~, >=, *, x).
-//   2. src/sdk.ts's `@ccgui/plugin-sdk mirror v<x.y.z>` stamp equals that pin.
+//   1. manifest.sdkVersion declares a >=x.y.z minimum, accepting newer hosts.
+//   2. src/sdk.ts's mirror stamp equals that minimum supported contract.
 //   3. the mirrored PluginContext's top-level capability keys are exactly the
 //      frozen set — a later sync dropping or renaming one fails here.
 import { readFileSync } from "node:fs";
@@ -17,19 +17,20 @@ const fail = (message) => {
 };
 
 const manifest = JSON.parse(readFileSync(resolve(root, "manifest.json"), "utf8"));
-const pin = manifest.sdkVersion;
-if (typeof pin !== "string" || !/^\d+\.\d+\.\d+$/.test(pin)) {
-  fail(`manifest.sdkVersion must be an exact x.y.z version, got ${JSON.stringify(pin)}`);
+const range = manifest.sdkVersion;
+const minimum = typeof range === "string" ? range.match(/^>=(\d+\.\d+\.\d+)$/) : null;
+if (!minimum) {
+  fail(`manifest.sdkVersion must declare a >=x.y.z minimum, got ${JSON.stringify(range)}`);
 }
 
 const sdk = readFileSync(resolve(root, "src/sdk.ts"), "utf8");
 const stamp = sdk.match(/@ccgui\/plugin-sdk mirror v(\d+\.\d+\.\d+)/);
 if (!stamp) fail("src/sdk.ts is missing its `@ccgui/plugin-sdk mirror v<x.y.z>` stamp");
-if (stamp[1] !== pin) fail(`src/sdk.ts stamp v${stamp[1]} != manifest.sdkVersion ${pin}`);
+if (stamp[1] !== minimum[1]) fail(`src/sdk.ts stamp v${stamp[1]} != minimum SDK ${minimum[1]}`);
 
 // This plugin mirrors only the capabilities it consumes; the set is frozen so
 // a future host sync that drops or adds a top-level key trips CI instead of
-// silently diverging from the contract this manifest pins.
+// silently diverging from the minimum supported contract.
 const expected = [
   "pluginId", "version", "react", "hooks", "workspace", "workspaces",
   "documentStorage", "ui", "i18n", "storage", "events", "host",
@@ -63,4 +64,4 @@ if (missing.length || extra.length) {
   );
 }
 
-console.log(`sdk-mirror ok: ccgui.client-context-bridge pins ${pin}, ${actual.length} capability keys`);
+console.log(`sdk-mirror ok: ccgui.client-context-bridge requires ${range}, ${actual.length} capability keys`);
