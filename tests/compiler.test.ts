@@ -190,4 +190,38 @@ describe("handoff compiler", () => {
     expect(protocol).toContain("a0");
   });
 
+  // A model copies the frame instructions verbatim, punctuation included, and
+  // the host matches the closing tag byte-exactly. A period fused to the tag
+  // teaches `</CCGUI_INTERNAL_<nonce>.`, which never closes the frame: the host
+  // then releases the whole payload into the visible transcript on flush.
+  it("never fuses punctuation to a frame tag or to the nonce", () => {
+    const nonce = "4d6f62f86b3097d487489d19c8628599";
+    const open = `<CCGUI_INTERNAL_${nonce}>`;
+    const close = `</CCGUI_INTERNAL_${nonce}>`;
+    const envelope = createEmptyEnvelope({ workspaceId: "w", engine: "claude", turnStatus: "completed", now: "2026-09-12T12:00:00.000Z" });
+    envelope.task.acceptance = [{ id: "a0", text: "keep", source: "user-stated", updatedAt: envelope.updatedAt }];
+
+    // Every turn the plugin can contribute on: first turn bare, first turn with
+    // a stored envelope, and every later turn.
+    for (const protocol of [
+      semanticProtocolContribution(nonce, true),
+      semanticProtocolContribution(nonce, true, envelope),
+      semanticProtocolContribution(nonce, false),
+    ]) {
+      expect(protocol).toContain(open);
+      expect(protocol).toContain(close);
+      for (const tag of [open, close]) {
+        for (let at = protocol.indexOf(tag); at >= 0; at = protocol.indexOf(tag, at + 1)) {
+          expect(protocol.slice(at + tag.length, at + tag.length + 1)).toMatch(/^(?:|\n| )$/);
+        }
+      }
+      // The nonce is copied into both tags, so a character fused to the
+      // declaration ends up inside the tag the host has to match.
+      const declaration = `Frame nonce: ${nonce}`;
+      const end = protocol.indexOf(declaration) + declaration.length;
+      expect(protocol.indexOf(declaration)).toBeGreaterThanOrEqual(0);
+      expect(protocol.slice(end, end + 1)).toMatch(/^(?:|\n)$/);
+    }
+  });
+
 });

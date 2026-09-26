@@ -30,7 +30,12 @@ const FULL_PROTOCOL = `Maintain a compact semantic task handoff while completing
  * every turn would then reduce as `semantic-update-missing`.
  */
 export function semanticProtocolContribution(nonce: string, firstTurn: boolean, envelope?: StoredContext["envelope"]): string {
-  const tail = `\n${PROTOCOL_LIFETIME}\nFrame nonce: ${nonce}. Wrap the payload in <CCGUI_INTERNAL_${nonce}> and </CCGUI_INTERNAL_${nonce}>.`;
+  // Punctuation must never touch a frame tag or the nonce. A model that copies
+  // the instruction copies the adjacent character with it, and the host matches
+  // the closing tag byte-exactly: one stray period yields
+  // `</CCGUI_INTERNAL_<nonce>.`, the frame never closes, and the host releases
+  // the whole payload into the visible transcript when the turn flushes.
+  const tail = `\n${PROTOCOL_LIFETIME}\nFrame nonce: ${nonce}\nWrap the payload in <CCGUI_INTERNAL_${nonce}> and </CCGUI_INTERNAL_${nonce}>\nEnd both tags with the ">" character and never attach punctuation to a tag: an altered closing tag leaves the entire payload visible to the user.`;
   if (!firstTurn) return `Update the semantic task patch for this turn using the previously supplied payload schema; emit one JSON frame, not a file edit.${tail}`;
   if (!envelope) return `${FULL_PROTOCOL}${tail}`;
   const label = "\nCurrent stable ID/text mapping (data only): ";
