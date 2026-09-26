@@ -9,9 +9,9 @@ CCGUI 市场插件。在不同 AI CLI 客户端（Claude Code / Codex CLI / Gemi
 - 上下文文件：`<ccgui-data>/plugin-data/ccgui.client-context-bridge/<workspace-id>.ccb`（UTF-8 JSON）
 - 插件不引入 SQLite 或 Protobuf；宿主对各 CLI 原生历史格式的读取与 `.ccb` 存储独立。
 
-## 硬性前提：需要 SDK 0.3.12 或更高版本的配套宿主
+## 硬性前提：需要 SDK 0.3.17 或更高版本的配套宿主
 
-本插件 `manifest.json` 声明 `sdkVersion: ">=0.3.12"`，保留最低版本要求并允许 `0.3.16` 及后续更高版本宿主通过握手，不再精确 pin。低于 `0.3.12` 时插件管理会拒绝加载。
+本插件 `manifest.json` 声明 `sdkVersion: ">=0.3.17"`，保留最低版本要求并允许后续更高版本宿主通过握手，不再精确 pin。低于 `0.3.17` 时插件管理会拒绝加载。
 宿主仍须提供下列通用接口；版本范围放行不代表缺失的接口会自动补齐，仅升级 AI CLI 也不能补齐宿主接口。
 
 需要配套的宿主构建：`desktop-cc-gui` 分支 `feat/client-context-bridge` 的 Windows 产物
