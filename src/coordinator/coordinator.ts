@@ -15,6 +15,7 @@ import type {
   RuntimeSwitchEvent,
   SessionCreatedEvent,
   SessionRestoredEvent,
+  WorkspaceMetadata,
 } from "../sdk";
 
 const RECOVERY_DELAY_MS = 10_000;
@@ -304,9 +305,9 @@ export class ClientContextCoordinator {
     const firstTurn = !this.initializedSessions.has(sessionKey);
     const promptContributions: PromptContribution[] = [];
 
-    const metadata = await this.context.workspace.getMetadata();
+    const metadata = await this.readWorkspaceMetadata(event.workspace);
     if (!isCurrent()) return;
-    const handoff = await this.getHandoff(event, isCurrent, lifetime, metadata.gitHead);
+    const handoff = await this.getHandoff(event, isCurrent, lifetime, metadata?.gitHead);
     if (!isCurrent()) return;
     if (handoff) promptContributions.push(handoff);
 
@@ -330,6 +331,18 @@ export class ClientContextCoordinator {
       } : undefined,
     });
     return { promptContributions, internalMessageCapture: { channel: CHANNEL, nonce, maxBytes: MAX_PATCH_BYTES, validate: isCompleteInternalFrame }, isCurrent: lifetime };
+  }
+
+  /** The SDK reads the active workspace, not the turn's workspace. Validate
+   *  the returned snapshot (including after a switch during the await), and
+   *  never let unavailable optional Git facts prevent background settlement. */
+  private async readWorkspaceMetadata(workspace: WorkspaceMetadata): Promise<WorkspaceMetadata | undefined> {
+    try {
+      const metadata = await this.context.workspace.getMetadata();
+      return metadata.id === workspace.id && metadata.path === workspace.path ? metadata : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async getHandoff(event: BeforeTurnEvent, isCurrent: () => boolean, lifetime: () => boolean, currentGitHead?: string): Promise<PromptContribution | undefined> {
@@ -444,7 +457,7 @@ export class ClientContextCoordinator {
     const patch = turn.patch;
     this.turns.delete(event.turnId);
     this.settleSessionIdentity(event);
-    const metadata = await this.context.workspace.getMetadata();
+    const metadata = await this.readWorkspaceMetadata(event.workspace);
     if (!isCurrent()) return;
     await this.serializeWorkspace(event.workspace.id, async () => {
       if (!isCurrent()) return;
@@ -453,10 +466,12 @@ export class ClientContextCoordinator {
       const turnFacts: HostFacts = {
         source: { engine: event.engine, nativeSessionId: event.sessionId ?? undefined, turnId: event.turnId, turnStatus: event.status },
         workspace: {
-          rootHint: metadata.path,
-          ...(metadata.gitBranch !== undefined ? { gitBranch: metadata.gitBranch } : {}),
-          ...(metadata.gitHead !== undefined ? { gitHead: metadata.gitHead } : {}),
-          ...(metadata.dirty !== undefined ? { dirty: metadata.dirty } : {}),
+          rootHint: event.workspace.path,
+          // Missing live facts leave previously observed Git history intact;
+          // the turn's launch snapshot is not a fresh settlement observation.
+          ...(metadata?.gitBranch !== undefined ? { gitBranch: metadata.gitBranch } : {}),
+          ...(metadata?.gitHead !== undefined ? { gitHead: metadata.gitHead } : {}),
+          ...(metadata?.dirty !== undefined ? { dirty: metadata.dirty } : {}),
         },
       };
       const accepted = this.acceptedHandoffFor(event, turn.handoff);

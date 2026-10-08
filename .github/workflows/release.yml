@@ -1,0 +1,81 @@
+name: Test, package and release plugin
+
+on:
+  push:
+    branches: [main]
+    tags: ["[0-9]*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:sdk
+      - run: npm run check:release
+      - run: npm test
+      - run: npm run build
+      - name: Package installable plugin and release assets
+        shell: bash
+        run: |
+          version=$(node -p "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8')).version")
+          bundle=package/ccgui-plugin-client-context-bridge
+          mkdir -p "$bundle/docs" release
+          cp dist/main.js dist/manifest.json release/
+          (cd release && sha256sum main.js manifest.json > checksums.txt)
+          cp release/main.js release/manifest.json release/checksums.txt README.md LICENSE "$bundle/"
+          cp docs/icon.svg docs/screenshot-settings.png docs/screenshot-workspace-menu.png "$bundle/docs/"
+          (cd package && zip -r "../release/ccgui-plugin-client-context-bridge-${version}.zip" ccgui-plugin-client-context-bridge)
+          (cd release && sha256sum "ccgui-plugin-client-context-bridge-${version}.zip" > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: ccgui-plugin-client-context-bridge
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: package
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact-id }}
+          merge-multiple: true
+          path: release
+      - name: Create GitHub Release from this run's verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" \
+            release/main.js \
+            release/manifest.json \
+            release/checksums.txt \
+            "release/ccgui-plugin-client-context-bridge-${RELEASE_TAG}.zip" \
+            release/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "CCB ${RELEASE_TAG}" \
+            --generate-notes

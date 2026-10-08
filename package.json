@@ -1,13 +1,15 @@
 {
   "name": "ccgui-plugin-client-context-bridge",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@10.29.3",
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "check:sdk": "node scripts/check-sdk-mirror.mjs",
+    "check:release": "node scripts/check-release.mjs",
     "build": "tsc --noEmit && vite build"
   },
   "devDependencies": {

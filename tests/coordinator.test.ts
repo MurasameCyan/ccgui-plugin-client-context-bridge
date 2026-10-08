@@ -637,6 +637,141 @@ describe("client context coordinator", () => {
     expect(rightNative.promptContributions?.find((entry) => entry.id === "ccb-protocol-right-native")?.content).not.toContain('"patch":{');
   });
 
+  it.each([true, false])("settles A after B becomes active without borrowing B metadata (stored Git: %s)", async (hasStoredGit) => {
+    const a = { id: "scope-a", path: "C:/isolated-scope/a", gitBranch: "feature/a", gitHead: "a".repeat(40), dirty: false };
+    const b = { id: "scope-b", path: "C:/isolated-scope/b", gitBranch: "feature/b", gitHead: "b".repeat(40), dirty: true };
+    const h = harness(a);
+    if (hasStoredGit) {
+      const envelope = createEmptyEnvelope({ workspaceId: a.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+      envelope.workspace = { rootHint: a.path, gitBranch: a.gitBranch, gitHead: a.gitHead, dirty: a.dirty };
+      h.documents.files.set(`${a.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    }
+    const other = { content: JSON.stringify(createEmptyEnvelope({ workspaceId: b.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt })), version: "other" };
+    h.documents.files.set(`${b.id}.ccb`, other);
+    h.coordinator.enable();
+    const hooks = h.registered.turn as TurnHooks;
+    const target = { ...turn, workspace: { id: a.id, path: a.path } };
+    await hooks.beforeTurn!(target);
+    hooks.onInternalMessage!({ ...target, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { goal: "Finish A in the background" }, append: { completed: ["A patch received"] } }) });
+    h.getMetadata.mockResolvedValue(b);
+    await hooks.afterTurn!({ ...target, sessionId: "session-a", status: "completed" });
+
+    const saved = parseCcbEnvelope(h.documents.files.get(`${a.id}.ccb`)!.content);
+    expect(saved.workspace).toEqual(hasStoredGit
+      ? { rootHint: a.path, gitBranch: a.gitBranch, gitHead: a.gitHead, dirty: a.dirty }
+      : { rootHint: a.path });
+    expect(saved.task.goal).toBe("Finish A in the background");
+    expect(saved.task.completed.map((entry) => entry.text)).toEqual(["A patch received"]);
+    expect(saved.source.nativeSessionId).toBe("session-a");
+    expect(h.documents.files.get(`${b.id}.ccb`)).toEqual(other);
+  });
+
+  it.each(["captured A", "newly active B"] as const)("scopes metadata returned after an active-workspace switch to its identity (%s)", async (returnedWorkspace) => {
+    const a = { ...workspace, gitBranch: "feature/a", gitHead: "a".repeat(40), dirty: false };
+    const b = { id: "workspace-2", path: "C:/other", gitBranch: "feature/b", gitHead: "b".repeat(40), dirty: true };
+    let active = a;
+    const h = harness(a);
+    h.coordinator.enable();
+    const hooks = h.registered.turn as TurnHooks;
+    await hooks.beforeTurn!(turn);
+    hooks.onInternalMessage!({ ...turn, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { goal: "Keep the patch across the metadata await" } }) });
+    const started = deferred();
+    const gate = deferred();
+    h.getMetadata.mockImplementationOnce(async () => {
+      const captured = active;
+      started.resolve();
+      await gate.promise;
+      return returnedWorkspace === "captured A" ? captured : active;
+    });
+    const settlement = hooks.afterTurn!({ ...turn, status: "completed" });
+    await started.promise;
+    active = b;
+    gate.resolve();
+    await settlement;
+
+    const saved = parseCcbEnvelope(h.documents.files.get(`${workspace.id}.ccb`)!.content);
+    expect(saved.workspace).toEqual(returnedWorkspace === "captured A"
+      ? { rootHint: workspace.path, gitBranch: a.gitBranch, gitHead: a.gitHead, dirty: a.dirty }
+      : { rootHint: workspace.path });
+    expect(saved.task.goal).toBe("Keep the patch across the metadata await");
+    expect(h.documents.files.has(`${b.id}.ccb`)).toBe(false);
+  });
+
+  it.each([
+    { label: "different id", metadata: { id: "workspace-2", path: workspace.path }, delayed: false },
+    { label: "different path", metadata: { id: workspace.id, path: "C:/other" }, delayed: false },
+    { label: "active project changes during the read", metadata: { id: "workspace-2", path: "C:/other" }, delayed: true },
+  ])("does not use another workspace's Git HEAD for A's handoff or saved facts ($label)", async ({ metadata, delayed }) => {
+    const h = harness({ ...workspace, gitHead: "a".repeat(40), dirty: false });
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.workspace = { rootHint: workspace.path, gitHead: "a".repeat(40), dirty: false };
+    envelope.task.goal = "Continue only A's context";
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    h.coordinator.enable();
+    const hooks = h.registered.turn as TurnHooks;
+    await (h.registered.runtimeSwitch as RuntimeSwitchHooks).beforeSwitch!(switchEvent);
+    let active: TestWorkspaceMetadata = { ...workspace, gitHead: "a".repeat(40), dirty: false };
+    const other = { ...metadata, gitHead: "b".repeat(40), dirty: true };
+    const started = deferred();
+    const gate = deferred();
+    if (!delayed) active = other;
+    h.getMetadata.mockImplementation(async () => {
+      started.resolve();
+      if (delayed) await gate.promise;
+      return active;
+    });
+    const target = { ...turn, engine: "codex" };
+    const preparing = hooks.beforeTurn!(target);
+    await started.promise;
+    active = other;
+    gate.resolve();
+    const prepared = await preparing;
+    const handoff = prepared?.promptContributions?.find((entry) => entry.id === "ccb-handoff");
+    expect(handoff?.content).toContain("Continue only A's context");
+    expect(handoff?.content).not.toContain("Git HEAD 已变化");
+    handoff!.onAccepted!();
+    hooks.onInternalMessage!({ ...target, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { nextAction: "Continue A, not B" } }) });
+    await hooks.afterTurn!({ ...target, sessionId: "accepted-a", status: "completed" });
+
+    const saved = parseCcbEnvelope(h.documents.files.get(`${workspace.id}.ccb`)!.content);
+    expect(saved.workspace).toEqual(envelope.workspace);
+    expect(saved.task.nextAction?.text).toBe("Continue A, not B");
+    expect(saved.consumption).toEqual([expect.objectContaining({ targetSessionId: "accepted-a", consumedRevision: envelope.revision })]);
+  });
+
+  it.each([
+    { label: "no active workspace", error: new Error("no active workspace"), failBefore: true, status: "completed" as const },
+    { label: "metadata read rejects at settlement", error: new Error("metadata unavailable"), failBefore: false, status: "cancelled" as const },
+  ])("preserves semantic patches and accepted handoffs when $label", async ({ error, failBefore, status }) => {
+    const h = harness();
+    const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
+    envelope.revision = 4;
+    envelope.workspace = { rootHint: workspace.path, gitHead: "a".repeat(40), dirty: false };
+    envelope.task.goal = "Continue the background task";
+    h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
+    h.coordinator.enable();
+    const hooks = h.registered.turn as TurnHooks;
+    await (h.registered.runtimeSwitch as RuntimeSwitchHooks).beforeSwitch!(switchEvent);
+    if (failBefore) h.getMetadata.mockRejectedValue(error);
+    const target = { ...turn, engine: "codex" };
+    const prepared = await hooks.beforeTurn!(target);
+    expect(prepared?.internalMessageCapture?.nonce).toBe(NONCE);
+    const handoff = prepared?.promptContributions?.find((entry) => entry.id === "ccb-handoff");
+    expect(handoff?.content).toContain("Continue the background task");
+    expect(handoff?.content).not.toContain("Git HEAD 已变化");
+    handoff!.onAccepted!();
+    hooks.onInternalMessage!({ ...target, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { goal: "Preserved despite missing optional metadata" }, append: { completed: ["Background result"] } }) });
+    h.getMetadata.mockRejectedValue(error);
+    await hooks.afterTurn!({ ...target, sessionId: "background-session", status });
+
+    const saved = parseCcbEnvelope(h.documents.files.get(`${workspace.id}.ccb`)!.content);
+    expect(saved.workspace).toEqual(envelope.workspace);
+    expect(saved.task.goal).toBe("Preserved despite missing optional metadata");
+    expect(saved.task.completed.map((entry) => entry.text)).toEqual(["Background result"]);
+    expect(saved.source.turnStatus).toBe(status);
+    expect(saved.consumption).toEqual([expect.objectContaining({ targetEngine: "codex", targetSessionId: "background-session", consumedRevision: 4 })]);
+  });
+
   it("persists host git facts and warns when the live Git HEAD differs from the handoff", async () => {
     const h = harness({ ...workspace, gitBranch: "feature/current", gitHead: "new-head", dirty: true });
     const envelope = createEmptyEnvelope({ workspaceId: workspace.id, engine: "claude", turnStatus: "completed", now: turn.occurredAt });
@@ -646,13 +781,17 @@ describe("client context coordinator", () => {
     h.documents.files.set(`${workspace.id}.ccb`, { content: JSON.stringify(envelope), version: "1" });
     h.coordinator.enable();
     const switchHooks = h.registered.runtimeSwitch as { beforeSwitch(event: unknown): Promise<void> };
-    const turnHooks = h.registered.turn as { beforeTurn(event: typeof turn): Promise<{ promptContributions?: TestContribution[] }>; afterTurn(event: unknown): Promise<void> };
+    const turnHooks = h.registered.turn as TurnHooks;
     await switchHooks.beforeSwitch(switchEvent);
-    const before = await turnHooks.beforeTurn({ ...turn, engine: "codex", sessionId: null });
-    expect(before.promptContributions?.find((entry) => entry.id === "ccb-handoff")?.content).toContain("Git HEAD 已变化");
-    await turnHooks.afterTurn({ ...turn, engine: "codex", status: "completed" });
-    const saved = JSON.parse(h.documents.files.get(`${workspace.id}.ccb`)!.content) as { workspace: TestWorkspaceMetadata };
-    expect(saved.workspace).toMatchObject({ rootHint: workspace.path, gitBranch: "feature/current", gitHead: "new-head", dirty: true });
+    const target = { ...turn, engine: "codex", sessionId: null };
+    const before = await turnHooks.beforeTurn!(target);
+    expect(before?.promptContributions?.find((entry) => entry.id === "ccb-handoff")?.content).toContain("Git HEAD 已变化");
+    turnHooks.onInternalMessage!({ ...target, channel: "semantic-patch", nonce: NONCE, payload: internalFrame({ set: { goal: "Persist this turn with fresh Git facts" } }) });
+    h.getMetadata.mockResolvedValue({ ...workspace, gitBranch: "feature/finished", gitHead: "finished-head", dirty: false });
+    await turnHooks.afterTurn!({ ...target, status: "completed" });
+    const saved = parseCcbEnvelope(h.documents.files.get(`${workspace.id}.ccb`)!.content);
+    expect(saved.workspace).toEqual({ rootHint: workspace.path, gitBranch: "feature/finished", gitHead: "finished-head", dirty: false });
+    expect(saved.task.goal).toBe("Persist this turn with fresh Git facts");
   });
 
   it("pauses writes, flushes dirty drafts, resumes, and purges drafts (maintenance API)", async () => {
