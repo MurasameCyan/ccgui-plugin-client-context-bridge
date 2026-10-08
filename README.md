@@ -16,9 +16,9 @@ CCGUI 市场插件。在不同 AI CLI 客户端（Claude Code / Codex CLI / Gemi
 `feat/client-context-bridge` 专用分支。已核对的上游源码为
 [`9c147cb3e`](https://github.com/zhukunpenglinyutong/desktop-cc-gui/tree/9c147cb3e2b2ecb55336e776b51ce84594c98919)。
 
-`manifest.json` 保留 `sdkVersion: ">=0.3.17"`，继续兼容已提供这些接口的旧配套宿主。
-这不是所有同版本上游构建都具备 CCB 能力的保证：版本握手通过后，宿主仍须提供下列接口。
-仅升级 AI CLI 不能补齐宿主接口。
+`manifest.json` 声明 `sdkVersion: ">=0.3.20"`，与上游 CCB 通用能力的最低版本一致。
+原版上游 SDK `0.3.17`–`0.3.19` 没有这批接口，因此在版本握手时拒绝加载；后续更高版本仍可通过，
+不要求与宿主精确同版。仅升级 AI CLI 不能补齐宿主接口。
 
 | 接口 | 必需权限 | 用途 |
 |---|---|---|
